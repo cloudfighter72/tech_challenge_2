@@ -1,0 +1,24 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+*.auto.tfvars
+*.tfvars
+!*.tfvars.example
+
+# Kubernetes / Helm
+kubeconfig*
+charts/*.tgz
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Secrets & local
+.env
+*.pem
+.DS_Store

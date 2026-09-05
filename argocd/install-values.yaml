@@ -1,0 +1,45 @@
+# Helm values for installing Argo CD itself (gitops branch, Phase 11).
+#   helm repo add argo https://argoproj.github.io/argo-helm
+#   helm upgrade --install argocd argo/argo-cd -n argocd --create-namespace \
+#     -f argocd/install-values.yaml
+
+global:
+  # A t3.small fleet is tight. Keep Argo CD lean or it evicts the app.
+  nodeSelector: {}
+
+configs:
+  params:
+    # Terminate TLS at the ALB, serve plain HTTP inside the cluster.
+    # Without this the ALB health check fails against an HTTPS-only pod.
+    server.insecure: true
+
+controller:
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+
+repoServer:
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+
+server:
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+  ingress:
+    enabled: true
+    ingressClassName: alb
+    annotations:
+      alb.ingress.kubernetes.io/scheme: internet-facing
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/healthcheck-path: /healthz
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    # Empty host = reachable on the ALB's own DNS name
+    hosts: []
+
+dex:
+  enabled: false          # no SSO needed for this challenge
+
+notifications:
+  enabled: false
+
+applicationSet:
+  enabled: false

@@ -1,0 +1,59 @@
+replicaCount: 1
+
+image:
+  # Overridden by CI: --set image.repository=<acct>.dkr.ecr.<region>.amazonaws.com/hello-world
+  repository: 185196963048.dkr.ecr.us-east-2.amazonaws.com/hello-world
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+
+service:
+  type: ClusterIP   # the ALB targets pods directly (target-type: ip)
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: true
+  className: alb
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
+  host: ""   # empty = match any host on the ALB DNS name
+
+# HPA percentages are computed against REQUESTS. Omit these and the HPA
+# reports <unknown>/50% forever.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 1
+  # 3 pods per node x 4 nodes. See README, "Scaling design".
+  maxReplicas: 12
+  targetCPUUtilizationPercentage: 50
+  targetMemoryUtilizationPercentage: 50
+
+# Spread one pod per node before stacking a second. ScheduleAnyway (not
+# DoNotSchedule) so replicas past the node count still schedule instead of
+# sitting Pending forever.
+topologySpread:
+  enabled: true
+  maxSkew: 1
+
+env:
+  APP_VERSION: "1.0.0"

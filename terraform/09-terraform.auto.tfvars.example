@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+region      = "us-east-2"
+my_ip_cidr  = "203.0.113.4/32"   # curl -s https://checkip.amazonaws.com
+github_repo = "cloudfighter72/tech_challenge_2"
+
+# EC2 key pair for SSH into Jenkins. Must already exist in this region.
+# Leave "" to rely on SSM Session Manager instead.
+jenkins_key_name = "ec2-lab-app"

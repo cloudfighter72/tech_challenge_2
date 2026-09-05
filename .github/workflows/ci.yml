@@ -1,0 +1,61 @@
+# gitops branch only. CI builds and pushes; Argo CD does the deploying.
+name: Build and Push to ECR
+
+on:
+  push:
+    branches: [gitops]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REPO: hello-world
+
+permissions:
+  id-token: write      # required for OIDC - no static AWS keys
+  contents: write      # required to commit the image tag back
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Guard against the tag-bump commit re-triggering this workflow.
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          TAG: ${{ github.sha }}
+        run: |
+          docker build -t $REGISTRY/$ECR_REPO:$TAG -t $REGISTRY/$ECR_REPO:latest ./app
+          docker push $REGISTRY/$ECR_REPO:$TAG
+          docker push $REGISTRY/$ECR_REPO:latest
+
+      - name: Bump image tag in Helm values
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          TAG: ${{ github.sha }}
+        run: |
+          sed -i "s|^  repository: .*|  repository: $REGISTRY/$ECR_REPO|" helm/hello-world/values.yaml
+          sed -i "s|^  tag: .*|  tag: \"$TAG\"|" helm/hello-world/values.yaml
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add helm/hello-world/values.yaml
+          git diff --staged --quiet || git commit -m "ci: deploy ${TAG:0:7} [skip ci]"
+          git push

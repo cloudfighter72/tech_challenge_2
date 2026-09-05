@@ -1,0 +1,21 @@
+# CRITICAL on Windows/Git Bash.
+# Git's autocrlf can check these out with CRLF line endings. A shell script with
+# CRLF fails on Amazon Linux with "bad interpreter: /bin/bash^M", and the Jenkins
+# EC2 bootstrap dies silently in user-data. Force LF for everything Linux runs.
+
+* text=auto eol=lf
+
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+Jenkinsfile text eol=lf
+Makefile    text eol=lf
+*.tf        text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.tpl       text eol=lf
+*.py        text eol=lf
+
+# Never touch these
+*.png binary
+*.jpg binary
+*.zip binary
