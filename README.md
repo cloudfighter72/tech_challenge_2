@@ -114,7 +114,11 @@ running inside the cluster (pull-based sync from Git).
 ```
 
 **Branching:** `main` = Jenkins. `gitops` = GitHub Actions + Argo CD. Kept separate on
-purpose; never merged. `argocd/` and `.github/workflows/ci.yml` exist only on `gitops`.
+purpose. `argocd/` and `.github/workflows/ci.yml` exist only on `gitops`.
+
+> Merging `main` into `gitops` replays the commit that removed those files from `main` and
+> deletes them from `gitops` as well. Bring shared fixes across with `git cherry-pick` of
+> the specific commits instead.
 
 ### Placeholders to replace before first run
 
@@ -522,27 +526,90 @@ On `gitops`, push-based CD is replaced by pull-based CD.
 ```bash
 helm repo add argo https://argoproj.github.io/argo-helm
 helm upgrade --install argocd argo/argo-cd -n argocd --create-namespace \
-  -f argocd/install-values.yaml
-kubectl -n argocd get secret argocd-initial-admin-secret \
-  -o jsonpath="{.data.password}" | base64 -d
+  -f argocd/install-values.yaml --wait --timeout 10m
+```
+
+Because the repository is private, Argo CD needs a credential before it can read the chart.
+Register one as a labelled secret in the `argocd` namespace:
+
+```bash
+kubectl create secret generic tc2-repo -n argocd \
+  --from-literal=type=git \
+  --from-literal=url=https://github.com/cloudfighter72/tech_challenge_2.git \
+  --from-literal=username=<github-username> \
+  --from-literal=password=<classic-pat-with-repo-scope>
+
+kubectl label secret tc2-repo -n argocd argocd.argoproj.io/secret-type=repository
+```
+
+Use a **classic** personal access token with the top-level `repo` scope. A fine-grained
+token must additionally be granted access to this specific repository and given at least
+`Contents: Read`; without that, Argo CD reports
+`authorization failed: Write access to repository not granted`, which is misleading — it
+only ever needs read.
+
+Then bootstrap the Application:
+
+```bash
 kubectl apply -f argocd/application.yaml
+kubectl get application -n argocd
+```
+
+If the status sits at `Unknown` after a credential change, Argo CD is serving a cached
+failure. Restart the repo server and force a refresh:
+
+```bash
+kubectl rollout restart deploy argocd-repo-server -n argocd
+kubectl patch application hello-world -n argocd --type merge \
+  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
 ```
 
 `install-values.yaml` sets `server.insecure: true` so TLS terminates at the ALB — without it
 the ALB health check fails against an HTTPS-only pod — and trims resource requests to fit
-the `t3.small` fleet. `application.yaml` watches `targetRevision: gitops`, path
-`helm/hello-world`, with `automated` sync: `prune` deletes resources removed from Git,
-`selfHeal` reverts manual `kubectl` drift.
+the `t3.small` fleet. It also enables an Ingress, so Argo CD provisions its **own** ALB
+alongside the application's; both must be removed at teardown. For local access, note that
+insecure mode serves plain HTTP, so the port-forward maps to port 80, not 443:
+
+```bash
+kubectl port-forward service/argocd-server -n argocd 8080:80
+# then browse to http://localhost:8080 (not https)
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 -d
+```
+
+`application.yaml` watches `targetRevision: gitops`, path `helm/hello-world`, with
+`automated` sync: `prune` deletes resources removed from Git, `selfHeal` reverts manual
+`kubectl` drift.
 
 **Why this differs from Jenkins:** Git is the single source of truth, cluster credentials
 never leave the cluster, and deployed state is auditable from commit history. The trade-off
 is an extra indirection — the image tag must be committed back before anything deploys.
 
-Set repo secret `AWS_ROLE_ARN` to the `github_actions_role_arn` Terraform output.
+Set repo secret `AWS_ROLE_ARN` to the `github_actions_role_arn` Terraform output, and set
+**Settings → Actions → General → Workflow permissions** to *Read and write*, which the
+tag-bump commit requires.
 
 Note: editors with Kubernetes schema validation flag `argocd/application.yaml` with
 "apiVersion and/or kind does not reference a known schema". `argoproj.io/v1alpha1` is a CRD
 installed by Argo CD itself, so the warning is expected until Argo CD is running.
+
+### Status at submission
+
+Argo CD is installed, authenticated against this private repository, and reporting
+`Synced` / `Healthy` against the `gitops` branch, managing the live Deployment, Service,
+Ingress, HPA and ServiceAccount. The pull-based CD half of the GitOps model is working and
+is evidenced below.
+
+The GitHub Actions half fails at the OIDC step with
+`Not authorized to perform sts:AssumeRoleWithWebIdentity`. The IAM configuration was
+verified and is correct as far as it can be inspected from the AWS side: the provider
+exists at `token.actions.githubusercontent.com`, its `ClientIDList` contains
+`sts.amazonaws.com`, and the role's trust policy matches
+`repo:cloudfighter72/tech_challenge_2:*` with the `sts.amazonaws.com` audience. Resolving it
+requires decoding the `sub` claim from a live workflow token to find where the mismatch
+actually is, which was not pursued within the challenge window. Image build and push to ECR
+are demonstrated by the Jenkins pipeline, which performs the same operations against the
+same registry.
 
 ---
 
@@ -657,7 +724,7 @@ minutes.
 
 ![HPA scaling back down to one replica](docs/screenshots/ALB_scaling2.png)
 
-### CI/CD
+### CI/CD — Jenkins
 
 The Jenkins user reaching the EKS API — verification that the security group rule in
 `07-sg_jenkins_eks.tf` works. Without it the pipeline hangs at **Configure kubectl**.
@@ -696,6 +763,32 @@ delivers code changes to the running cluster — not just that it exits zero.
 
 ![Application showing the Jenkins-deployed change](docs/screenshots/browser_deployed_by_Jenkins.png)
 
+### CI/CD — GitOps
+
+Argo CD tracking the `gitops` branch at `helm/hello-world`, `Healthy` and `Synced`.
+
+![Argo CD applications list showing hello-world synced](docs/screenshots/argo_login.png)
+
+The application resource tree. Argo CD owns the Deployment, Service, Ingress, HPA and
+ServiceAccount, and the ReplicaSet history shows the revisions it has managed through.
+
+![Argo CD resource tree for hello-world](docs/screenshots/argo_view.png)
+
+The classic personal access token created for Argo CD's repository access, confirmed by
+GitHub's notification. A classic token with `repo` scope is required here — a fine-grained
+token fails with a misleading "Write access not granted" error.
+
+![GitHub notification confirming the classic PAT was created](docs/screenshots/argocd_email.png)
+
+The same state from the CLI after a hard refresh.
+
+![kubectl get application showing Synced and Healthy](docs/screenshots/argocd_health.png)
+
+The GitHub Actions half, failing at the OIDC credential step — see
+[Status at submission](#status-at-submission) for the diagnosis.
+
+![GitHub Actions workflow run failing](docs/screenshots/git_ops_fail.png)
+
 ---
 
 ## Troubleshooting
@@ -714,13 +807,17 @@ Issues actually hit during this build, and their fixes:
 | Terraform plans an EKS version downgrade | Control plane auto-upgraded; `var.cluster_version` left behind | Match the variable to the live version, or target only the resource you want |
 | Terraform reports "no changes" after adding a file | The `.tf` file was saved outside `terraform/` | Terraform reads only its own working directory |
 | Jenkins UI unreachable on 8080 | `my_ip_cidr` no longer matches your public IP | `curl -s https://checkip.amazonaws.com`, update tfvars, re-apply |
+| Argo CD: `Write access to repository not granted` | Fine-grained PAT without this repo granted | Use a classic PAT with `repo` scope |
+| Argo CD stuck `Unknown` after fixing credentials | Repo server cached the failure | Restart `argocd-repo-server`, then hard-refresh the Application |
+| Argo CD port-forward resets the connection | `server.insecure: true` serves HTTP, not TLS | Forward to `:80` and browse over `http://` |
+| GitHub Actions: `Not authorized to perform sts:AssumeRoleWithWebIdentity` | OIDC subject mismatch — unresolved | See [Status at submission](#status-at-submission) |
+| GitOps files vanish from the `gitops` branch | `git merge main` replayed the deletion commit from `main` | `git checkout <commit> -- <paths>`; use cherry-pick instead of merge |
 | Ingress has no `ADDRESS` | Missing `kubernetes.io/role/elb` subnet tags, or ALB controller IRSA | `kubectl logs -n kube-system deploy/aws-load-balancer-controller` |
 | HPA shows `<unknown>/50%` | metrics-server absent, or no resource **requests** | Install metrics-server; set requests |
 | Pods `Pending`, node count flat | Autoscaler can't discover the ASG | Check `k8s.io/cluster-autoscaler/*` tags on the ASG; read autoscaler logs |
 | Jenkins: "You must be logged in to the server" | Jenkins IAM role not mapped into EKS | Confirm the `access_entries` block in `02-eks.tf` applied |
 | Jenkins: `docker: permission denied` | `jenkins` not in the `docker` group | `usermod -aG docker jenkins && systemctl restart jenkins` |
 | `ImagePullBackOff` | Node role lacks ECR read | `iam_role_additional_policies` in `02-eks.tf` |
-| Argo CD stuck `OutOfSync` | Wrong `targetRevision`, or the bot lacks write permission | Confirm branch `gitops` and workflow `contents: write` |
 
 ### State recovery
 
@@ -740,16 +837,23 @@ rm errored.tfstate
 
 Take your screenshots first — this is irreversible.
 
-Order matters. Terraform does not know about the ALB and security groups the controller
-created, and will hang on the VPC delete if they are still present:
+Order matters. Terraform does not know about the load balancers and security groups the
+controller created, and will hang on the VPC delete if they are still present. There are
+**two** ALBs to release: the application's and Argo CD's.
 
 ```bash
+kubectl delete -f argocd/application.yaml     # gitops branch only
+helm uninstall argocd -n argocd               # gitops branch only
 helm uninstall hello-world -n hello-world
 kubectl delete ingress --all -A
-# wait until the ALB is gone from the EC2 console
+# wait until both ALBs are gone from the EC2 console
 cd terraform
 terraform destroy
 ```
 
 Then confirm in the console that no ALBs, NAT gateways, Elastic IPs or orphaned ENIs remain.
-Running cost with the cluster, ALB, NAT gateway and Jenkins instance up is roughly $8/day.
+Running cost with the cluster, both ALBs, NAT gateway and Jenkins instance up is roughly
+$8/day.
+
+Finally, revoke the GitHub personal access tokens created for Jenkins and Argo CD — they
+are no longer needed once the cluster is gone.
