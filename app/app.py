@@ -16,6 +16,7 @@ def hello():
         "<html><head><title>Tech Challenge 2</title></head>"
         "<body style='font-family:system-ui;text-align:center;padding-top:15vh'>"
         "<h1>Hello, World!</h1>"
+        "<p>deployed by Jenkins</p>"
         f"<p>version {VERSION}</p>"
         f"<p style='color:#666'>served by pod {socket.gethostname()}</p>"
         "</body></html>"
