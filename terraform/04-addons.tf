@@ -13,8 +13,8 @@ resource "helm_release" "metrics_server" {
 
   set = [
     {
-      name  = "args[0]"
-      value = "--kubelet-insecure-tls"
+      name  = "args"
+      value = "{--kubelet-insecure-tls}"
     }
   ]
 
