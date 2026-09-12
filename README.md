@@ -789,6 +789,35 @@ The GitHub Actions half, failing at the OIDC credential step — see
 
 ![GitHub Actions workflow run failing](docs/screenshots/git_ops_fail.png)
 
+### Teardown
+
+Argo CD and the application uninstalled first, so the controller releases both load
+balancers before Terraform touches the VPC. Note that Argo CD's CRDs are retained by its
+own resource policy — they are removed with the namespace.
+
+![Argo CD Application deleted and Helm releases uninstalled](docs/screenshots/argo_teardown.png)
+
+Both ALBs gone. Terraform has no knowledge of these — they were created by the AWS Load
+Balancer Controller in response to Ingress objects — so destroying the VPC while they are
+still attached stalls on a dependency Terraform cannot see. The empty result here is the
+signal that it is safe to continue.
+
+![No load balancers remaining in the region](docs/screenshots/ALB_teardown.png)
+
+`terraform destroy` complete: 85 resources removed, ending with the VPC itself.
+
+![terraform destroy complete, 85 resources destroyed](docs/screenshots/tf_destroy.png)
+
+No EKS clusters remain in `us-east-2`.
+
+![aws eks list-clusters returning an empty list](docs/screenshots/eks_teardown.png)
+
+All three EC2 instances terminated — the two `t3.small` worker nodes and the `t3.medium`
+Jenkins controller. With the cluster, both ALBs, the NAT gateway and these instances gone,
+the project incurs no further charges.
+
+![EC2 console showing all instances terminated](docs/screenshots/ec2_terminated.png)
+
 ---
 
 ## Troubleshooting
