@@ -3,7 +3,7 @@ replicaCount: 1
 image:
   # Overridden by CI: --set image.repository=<acct>.dkr.ecr.<region>.amazonaws.com/hello-world
   repository: 185196963048.dkr.ecr.us-east-2.amazonaws.com/hello-world
-  tag: "a1e8f1f8bb6945e3e016d3e48aa5b608c92f0b89"
+  tag: "f113cefb39544a8f4a38be9a712bf148c855d359"
   pullPolicy: IfNotPresent
 
 nameOverride: ""
