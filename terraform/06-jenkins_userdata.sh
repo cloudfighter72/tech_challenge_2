@@ -3,7 +3,7 @@ set -euxo pipefail
 exec > >(tee /var/log/user-data.log) 2>&1
 
 dnf update -y
-dnf install -y java-17-amazon-corretto-headless git wget tar unzip docker
+dnf install -y java-21-amazon-corretto-headless git wget tar unzip docker
 
 # --- Jenkins ---
 wget -O /etc/yum.repos.d/jenkins.repo https://pkg.jenkins.io/redhat-stable/jenkins.repo
@@ -28,9 +28,11 @@ curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 |
 
 # Pre-seed kubeconfig for the jenkins user so the pipeline's first run works.
 # Harmless if the cluster isn't up yet - the pipeline refreshes it every build.
+# chown must come before update-kubeconfig: mkdir runs as root, so the jenkins
+# user can't write to .kube until ownership is fixed.
 mkdir -p /var/lib/jenkins/.kube
+chown -R jenkins:jenkins /var/lib/jenkins/.kube
 su - jenkins -s /bin/bash -c \
   "aws eks update-kubeconfig --name ${cluster_name} --region ${region}" || true
-chown -R jenkins:jenkins /var/lib/jenkins/.kube
-
+  
 systemctl enable --now jenkins
