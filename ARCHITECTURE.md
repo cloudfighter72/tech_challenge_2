@@ -594,217 +594,25 @@ Note: editors with Kubernetes schema validation flag `argocd/application.yaml` w
 "apiVersion and/or kind does not reference a known schema". `argoproj.io/v1alpha1` is a CRD
 installed by Argo CD itself, so the warning is expected until Argo CD is running.
 
-### Status at submission
-
-Argo CD is installed, authenticated against this private repository, and reporting
-`Synced` / `Healthy` against the `gitops` branch, managing the live Deployment, Service,
-Ingress, HPA and ServiceAccount. The pull-based CD half of the GitOps model is working and
-is evidenced below.
-
-The GitHub Actions half fails at the OIDC step with
-`Not authorized to perform sts:AssumeRoleWithWebIdentity`. The IAM configuration was
-verified and is correct as far as it can be inspected from the AWS side: the provider
-exists at `token.actions.githubusercontent.com`, its `ClientIDList` contains
-`sts.amazonaws.com`, and the role's trust policy matches
-`repo:cloudfighter72/tech_challenge_2:*` with the `sts.amazonaws.com` audience. Resolving it
-requires decoding the `sub` claim from a live workflow token to find where the mismatch
-actually is, which was not pursued within the challenge window. Image build and push to ECR
-are demonstrated by the Jenkins pipeline, which performs the same operations against the
-same registry.
-
----
-
-### Repository and submission
-
-Private repository with the mentor invited as a collaborator.
-
-![Private repository with mentor invited](docs/screenshots/github_collab_private.png)
-
-### Infrastructure
-
-Terraform plan before the first apply — 64 resources, including the cluster KMS key and
-node group validation.
-
-![Terraform plan, 64 resources to add](docs/screenshots/tfplan.png)
-
-First pass complete: VPC and EKS control plane only.
-
-![Terraform apply pass 1 complete](docs/screenshots/tf_apply_complete.png)
-
-The node reaches `Ready` before the add-ons are applied. This ordering is the whole reason
-for the two-pass apply.
-
-![First node Ready](docs/screenshots/node_ready.png)
-
-![Node Ready at min size with kubeconfig context](docs/screenshots/kubectl_get_nodes.png)
-
-Second pass: add-ons, ECR, Jenkins and the GitHub OIDC role — 20 resources.
-
-![Terraform apply pass 2 complete with outputs](docs/screenshots/tf_apply_complete_2.png)
-
-All four `kube-system` deployments available, and `kubectl top nodes` returning real
-figures — the prerequisite for the HPA to function at all.
-
-![kube-system deployments and node metrics](docs/screenshots/kube_nodes.png)
-
-### Application
-
-Local image build: layered dependency install, non-root `appuser`.
-
-![Local docker build](docs/screenshots/ECR_image1.png)
-
-Manual push to ECR as a fallback image before CI/CD exists.
-
-![Manual push to ECR](docs/screenshots/ECR_image2.png)
-
-First Helm release: one pod running, HPA reporting real percentages, Ingress resolved to an
-ALB hostname.
-
-![Pod, HPA and Ingress after first Helm install](docs/screenshots/Helm_ALB.png)
-
-The application served through the ALB.
-
-![Hello World served through the ALB](docs/screenshots/browser_hello_world.png)
-
-The ALB itself — internet-facing, spanning two availability zones.
-
-![ALB active in the EC2 console](docs/screenshots/ALB_console.png)
-
-Target group health. The registered target is a **pod IP**, not a node — confirming
-`alb.ingress.kubernetes.io/target-type: ip` is in effect.
-
-![Target group with one healthy pod IP](docs/screenshots/ALB_target_group.png)
-
-### Scaling
-
-Three parallel load generators. One sequential `wget` loop is not enough to push a Flask pod
-past 50% of a 100m CPU request.
-
-![Load generator 1](docs/screenshots/load_test_01.png)
-
-![Load generator 2](docs/screenshots/load_test_02.png)
-
-![Load generator 3](docs/screenshots/load_test_03.png)
-
-HPA scale-up. CPU peaks at 389% of target, replicas climb 1 → 5 → 8, then utilization falls
-as the new pods absorb the load. Memory stays flat at 21% throughout — CPU is the driving
-metric, which is what the 256Mi request was sized to allow.
-
-![HPA scaling up under load](docs/screenshots/load_test_works.png)
-
-Cluster Autoscaler adds nodes as pods become unschedulable, then cordons and drains them on
-the way back down.
-
-![Nodes scaling 1 to 3 and draining](docs/screenshots/node_scaling1.png)
-
-The Auto Scaling group at desired capacity 3, within the configured 1–4 limits.
-
-![ASG at desired capacity 3](docs/screenshots/ASG_console.png)
-
-Pod distribution at peak: 11 replicas spread 4 / 3 / 4 across three nodes. The
-`topologySpreadConstraints` balance rather than stack.
-
-![11 pods distributed across three nodes](docs/screenshots/ALB_scaling.png)
-
-Scale-down. The HPA steps 11 → 5 → 3 → 2 → 1 rather than dropping at once, because it uses a
-120-second stabilization window and the highest recommendation from the preceding five
-minutes.
-
-![HPA scaling back down to one replica](docs/screenshots/ALB_scaling2.png)
-
-### CI/CD — Jenkins
-
-The Jenkins user reaching the EKS API — verification that the security group rule in
-`07-sg_jenkins_eks.tf` works. Without it the pipeline hangs at **Configure kubectl**.
-
-![Jenkins user running kubectl against the cluster](docs/screenshots/ssh_ec2.png)
-
-Build #1, checked out at the triggering commit.
-
-![Jenkins build 1 status](docs/screenshots/Jenkins_UI_build.png)
-
-![Jenkins build 1 stage view](docs/screenshots/Jenkins_UI_stages.png)
-
-Builds #1 and #2, every stage green. Build #2 picked up two commits and completed in 34
-seconds.
-
-![Jenkins builds 1 and 2, all stages green](docs/screenshots/Jenkins_build_2.png)
-
-The **Push to ECR** stage. Authentication comes from the EC2 instance profile — no AWS
-credentials are stored in Jenkins.
-
-![Jenkins pushing the image to ECR](docs/screenshots/Jenkins_ecr_push.png)
-
-The **Deploy with Helm** and **Verify Rollout** stages. `REVISION: 2` shows the pipeline
-upgraded the existing release rather than creating a parallel one, and the pipeline echoes
-the live URL.
-
-![Jenkins helm upgrade and rollout verification](docs/screenshots/Jenkins_helm_upgrade.png)
-
-ECR after both builds: `v1` from the manual push, then `1` and `2, latest` from Jenkins,
-each with a distinct digest and a "last pulled" timestamp proving the cluster consumed them.
-
-![ECR image tags with timestamps](docs/screenshots/AWS_ECR_tags.png)
-
-The deployed change, live. `deployed by Jenkins` and `version build-2` confirm the pipeline
-delivers code changes to the running cluster — not just that it exits zero.
-
-![Application showing the Jenkins-deployed change](docs/screenshots/browser_deployed_by_Jenkins.png)
-
-### CI/CD — GitOps
-
-Argo CD tracking the `gitops` branch at `helm/hello-world`, `Healthy` and `Synced`.
-
-![Argo CD applications list showing hello-world synced](docs/screenshots/argo_login.png)
-
-The application resource tree. Argo CD owns the Deployment, Service, Ingress, HPA and
-ServiceAccount, and the ReplicaSet history shows the revisions it has managed through.
-
-![Argo CD resource tree for hello-world](docs/screenshots/argo_view.png)
-
-The classic personal access token created for Argo CD's repository access, confirmed by
-GitHub's notification. A classic token with `repo` scope is required here — a fine-grained
-token fails with a misleading "Write access not granted" error.
-
-![GitHub notification confirming the classic PAT was created](docs/screenshots/argocd_email.png)
-
-The same state from the CLI after a hard refresh.
-
-![kubectl get application showing Synced and Healthy](docs/screenshots/argocd_health.png)
-
-The GitHub Actions half, failing at the OIDC credential step — see
-[Status at submission](#status-at-submission) for the diagnosis.
-
-![GitHub Actions workflow run failing](docs/screenshots/git_ops_fail.png)
-
-### Teardown
-
-Argo CD and the application uninstalled first, so the controller releases both load
-balancers before Terraform touches the VPC. Note that Argo CD's CRDs are retained by its
-own resource policy — they are removed with the namespace.
-
-![Argo CD Application deleted and Helm releases uninstalled](docs/screenshots/argo_teardown.png)
-
-Both ALBs gone. Terraform has no knowledge of these — they were created by the AWS Load
-Balancer Controller in response to Ingress objects — so destroying the VPC while they are
-still attached stalls on a dependency Terraform cannot see. The empty result here is the
-signal that it is safe to continue.
-
-![No load balancers remaining in the region](docs/screenshots/ALB_teardown.png)
-
-`terraform destroy` complete: 85 resources removed, ending with the VPC itself.
-
-![terraform destroy complete, 85 resources destroyed](docs/screenshots/tf_destroy.png)
-
-No EKS clusters remain in `us-east-2`.
-
-![aws eks list-clusters returning an empty list](docs/screenshots/eks_teardown.png)
-
-All three EC2 instances terminated — the two `t3.small` worker nodes and the `t3.medium`
-Jenkins controller. With the cluster, both ALBs, the NAT gateway and these instances gone,
-the project incurs no further charges.
-
-![EC2 console showing all instances terminated](docs/screenshots/ec2_terminated.png)
+### GitOps status
+
+Both halves of the GitOps pipeline work.
+
+**CI** — GitHub Actions authenticates to AWS via OIDC with no stored
+credentials, builds the image, pushes it to ECR tagged with the commit SHA,
+and commits the new tag back to `helm/hello-world/values.yaml`.
+
+**CD** — Argo CD watches the `gitops` branch, detects the tag bump, and
+syncs it into the cluster, reporting `Synced` / `Healthy` while managing the
+Deployment, Service, Ingress, HPA and ServiceAccount.
+
+The OIDC trust policy accepts both the plain and ID-qualified subject
+formats. GitHub's immutable identifiers setting embeds the account and
+repository IDs in the `sub` claim
+(`repo:cloudfighter72@230795171/tech_challenge_2@1358373959:...`), which no
+guide predating that feature accounts for. See
+[Step 25](README.md#step-25--solving-the-github-actions-oidc-failure) in the
+build log for the diagnosis.
 
 ---
 
@@ -827,7 +635,7 @@ Issues actually hit during this build, and their fixes:
 | Argo CD: `Write access to repository not granted` | Fine-grained PAT without this repo granted | Use a classic PAT with `repo` scope |
 | Argo CD stuck `Unknown` after fixing credentials | Repo server cached the failure | Restart `argocd-repo-server`, then hard-refresh the Application |
 | Argo CD port-forward resets the connection | `server.insecure: true` serves HTTP, not TLS | Forward to `:80` and browse over `http://` |
-| GitHub Actions: `Not authorized to perform sts:AssumeRoleWithWebIdentity` | OIDC subject mismatch — unresolved | See [Status at submission](#status-at-submission) |
+| GitHub Actions: `Not authorized to perform sts:AssumeRoleWithWebIdentity` | GitHub's immutable identifiers setting embeds account and repo IDs in the OIDC `sub` claim, so `repo:owner/name:*` never matches | Print the decoded claim with `core.getIDToken()`, then match the actual subject in the trust policy — see [Step 25](README.md#step-25--solving-the-github-actions-oidc-failure) |
 | GitOps files vanish from the `gitops` branch | `git merge main` replayed the deletion commit from `main` | `git checkout <commit> -- <paths>`; use cherry-pick instead of merge |
 | Ingress has no `ADDRESS` | Missing `kubernetes.io/role/elb` subnet tags, or ALB controller IRSA | `kubectl logs -n kube-system deploy/aws-load-balancer-controller` |
 | HPA shows `<unknown>/50%` | metrics-server absent, or no resource **requests** | Install metrics-server; set requests |

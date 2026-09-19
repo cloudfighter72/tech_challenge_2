@@ -26,7 +26,10 @@ data "aws_iam_policy_document" "github_actions_assume" {
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repo}:*"]
+      values = [
+        "repo:${var.github_repo}:*",
+        "repo:cloudfighter72@230795171/tech_challenge_2@1358373959:*"
+      ]
     }
   }
 }
