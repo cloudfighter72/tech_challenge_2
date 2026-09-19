@@ -702,19 +702,17 @@ kubectl port-forward service/argocd-server -n argocd 8080:80
 Argo CD owns the Deployment, Service, Ingress, HPA and ServiceAccount, with
 the ReplicaSet history showing the revisions it has managed through.
 
-### Step 25 — The GitHub Actions half, unresolved
+### Step 25 — Solving the GitHub Actions OIDC failure
 
-The CI side of the GitOps branch does not work. It fails at the OIDC
-credential step:
-
-![GitHub Actions workflow run failing](docs/screenshots/git_ops_fail.png)
+The CI side of the GitOps branch failed at the credentials step:
 
 ```text
 Error: Could not assume role with OIDC:
 Not authorized to perform sts:AssumeRoleWithWebIdentity
 ```
 
-I verified everything inspectable from the AWS side:
+My first approach was to re-check every component of the configuration.
+All of it was correct:
 
 ```bash
 aws iam get-role --role-name tc2-github-actions \
@@ -723,24 +721,86 @@ aws iam get-open-id-connect-provider \
   --open-id-connect-provider-arn arn:aws:iam::185196963048:oidc-provider/token.actions.githubusercontent.com
 ```
 
-The provider exists at `token.actions.githubusercontent.com`, its
-`ClientIDList` contains `sts.amazonaws.com`, and the role's trust policy
-matches `repo:cloudfighter72/tech_challenge_2:*` with the correct audience
-condition. The workflow requests `id-token: write`, and the `AWS_ROLE_ARN`
-repository secret exists. I also set Workflow permissions to "Read and
-write", which the tag-bump commit needs.
+The provider existed at `token.actions.githubusercontent.com`, its
+`ClientIDList` contained `sts.amazonaws.com`, and the role's trust policy
+matched `repo:cloudfighter72/tech_challenge_2:*` with the correct audience
+condition. The workflow requested `id-token: write`, the `AWS_ROLE_ARN`
+secret was set, and Workflow permissions were set to read and write.
 
-Every component checks out individually and the assumption is still
-rejected. Resolving it properly means adding a debug step that prints the
-decoded `sub` claim from a live workflow token and comparing it against the
-trust policy character by character, rather than continuing to guess at
-configuration that already looks correct. I ran out of time in the
-challenge window before doing that.
+Every piece checked out individually, and AWS still rejected the
+assumption. That is the point at which re-reading configuration stops being
+useful — the mismatch had to be in the token itself, which I had never
+looked at. So I added a temporary step to print the decoded claims before
+the credentials step ran:
 
-What this means in practice: the pull-based CD half of GitOps works and is
-demonstrated above. The image build and push to ECR, which is what the
-Actions workflow would do, is demonstrated by the Jenkins pipeline
-performing the same operations against the same registry.
+```yaml
+      - name: Debug OIDC claims
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = await core.getIDToken('sts.amazonaws.com')
+            const payload = JSON.parse(
+              Buffer.from(token.split('.')[1], 'base64').toString()
+            )
+            core.info('sub: ' + payload.sub)
+            core.info('aud: ' + payload.aud)
+            core.info('repository: ' + payload.repository)
+```
+
+That gave the answer immediately:
+
+```text
+sub: repo:cloudfighter72@230795171/tech_challenge_2@1358373959:ref:refs/heads/gitops
+aud: sts.amazonaws.com
+repository: cloudfighter72/tech_challenge_2
+```
+
+The subject claim carries my account ID and the repository ID appended to
+their names: `cloudfighter72@230795171` and `tech_challenge_2@1358373959`.
+My trust policy matched `repo:cloudfighter72/tech_challenge_2:*`, which has
+no `@<id>` segments, so the `StringLike` condition never matched.
+
+This comes from GitHub's **immutable identifiers** setting for OIDC. It
+pins the subject to numeric IDs so that renaming a repository or
+transferring an account cannot silently inherit an existing trust
+relationship. It is a sensible security property, and it is why essentially
+every OIDC guide is now subtly wrong — they all show `repo:owner/name:*`
+because they were written before the feature existed. Following the
+documentation correctly still produces a policy that does not match.
+
+The fix accepts both formats, so the policy keeps working whether or not
+the setting is enabled:
+
+```hcl
+    condition {
+      test     = "StringLike"
+      variable = "token.actions.githubusercontent.com:sub"
+      values = [
+        "repo:${var.github_repo}:*",
+        "repo:cloudfighter72@230795171/tech_challenge_2@1358373959:*"
+      ]
+    }
+```
+
+```bash
+terraform apply -target=aws_iam_role.github_actions
+```
+
+After applying, the OIDC step passed and the workflow ran end to end —
+authenticate, log in to ECR, build, push both tags, and commit the image
+tag bump back to `values.yaml` for Argo CD to pick up.
+
+![GitHub Actions workflow running every step successfully](docs/screenshots/gitOIDC.png)
+
+I removed the debug step afterward. Printing token claims is fine as a
+diagnostic and not something to leave in a pipeline.
+
+**What I would do differently:** I spent the original challenge window
+re-checking configuration that was already correct, because each component
+looked right in isolation. Reading the actual claim took one step and
+five minutes. When every input to a system checks out and the output is
+still wrong, the next move is to inspect what the system is actually
+sending rather than what it should be sending.
 
 ---
 
