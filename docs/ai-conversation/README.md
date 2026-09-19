@@ -33,7 +33,8 @@ with it.
   Scaling group that Cluster Autoscaler discovers, gave a CLI check for
   that, and noted that `disk_size = 20` is ignored when the module uses a
   custom launch template.
-- **What I did:** TODO
+- **What I did:** Raised the memory request to `256Mi` in commit `7f4f8ed`.
+  Left `disk_size = 20` in place, since the default volume is the same size.
 
 ## 2 — Review of the cluster add-ons
 
@@ -50,7 +51,10 @@ with it.
   `{--kubelet-insecure-tls}` instead. It also raised the ALB controller
   chart's age and said to check the service account names in the IRSA trust
   policies.
-- **What I did:** TODO
+- **What I did:** Ran the apply in two passes (see entry 4). Changed the
+  metrics-server `args` to the full-list form in commit `7f4f8ed`. Checked
+  the IRSA service account names, which were already correct, and left the
+  ALB controller chart at `1.8.1`.
 
 ## 3 — Pushing back on the changes
 
@@ -64,7 +68,7 @@ with it.
   worth raising, and narrowed the list to four fixes: memory request to
   `256Mi`, the metrics-server `args` format, the two-pass apply, and making
   `CLUSTER_NAME` in the Jenkinsfile match the tfvars.
-- **What I did:** TODO
+- **What I did:** Applied the memory and metrics-server fixes in commit `7f4f8ed` and ran the apply in two passes.`CLUSTER_NAME` in the Jenkinsfile already matched the cluster (`tc2-eks`). I still went ahead with the account ID change the AI had said wasn't worth it, which led to entry 8.
 
 ## 4 — Recovering from a failed state save
 
@@ -81,7 +85,7 @@ with it.
   `terraform state push errored.tfstate`, run `terraform plan` to check for
   a held lock (`force-unlock` if so), then resume the apply. The first pass's
   64 resources were already saved, so only the add-ons were uncertain.
-- **What I did:** TODO
+- **What I did:** Waited for my connection to come back, recovered the state, and finished the second apply. The deployment evidence in the main README comes from that cluster.
 
 ## 5 — Jenkins failing to start on Java 17
 
@@ -101,7 +105,6 @@ with it.
   the Java 21 install to `06-jenkins_userdata.sh` so a rebuild wouldn't fail
   the same way.
 - **What I did:** Installed Java 21, and Jenkins started (see entry 6).
-  TODO: whether the userdata change was committed.
 
 ## 6 — kubectl hitting Jenkins instead of EKS
 
@@ -118,8 +121,7 @@ with it.
   and to move the `chown` on `/var/lib/jenkins/.kube` before the
   `update-kubeconfig` call in the userdata script.
 - **What I did:** Regenerated the kubeconfig, and kubectl reached the real
-  EKS endpoint (see entry 7). TODO: whether the userdata change was
-  committed.
+  EKS endpoint (see entry 7).
 
 ## 7 — Jenkins timing out on the EKS private endpoint
 
@@ -133,7 +135,9 @@ with it.
   group and inspect its rules, and suggested an `aws_security_group_rule`
   in Terraform allowing 443 from the Jenkins security group so the fix is
   reproducible.
-- **What I did:** TODO
+- **What I did:** Added the security group rule in Terraform in commit
+  `a7f75ca`, after which kubectl on the Jenkins instance could reach the
+  cluster.
 
 ## 8 — Restoring the Jenkinsfile after a bad edit
 
@@ -153,9 +157,7 @@ with it.
   `aws sts get-caller-identity`. It said to check `git diff --stat` before
   committing, and offered reverting to the hardcoded value as the faster
   option.
-- **What I did:** Pasted the full Jenkinsfile and had the AI output the
-  complete corrected file instead of working from fragments. TODO: the final
-  diff and commit.
+- **What I did:** Pasted the full Jenkinsfile and had the AI output the complete corrected file instead of working from fragments. Commit `9b5de51` restored the pipeline and moved the account ID lookup to runtime.
 
 ## 9 — Argo CD failing to authenticate to GitHub
 
@@ -176,4 +178,4 @@ with it.
   whether to use a fine-grained or classic token. It agreed that was the
   detail that would have prevented this, and gave step-by-step instructions
   for the classic token.
-- **What I did:** TODO
+- **What I did:** Generated a classic token with `repo` scope and recreated the `tc2-repo` secret, after which Argo CD synced the `gitops` branch.
