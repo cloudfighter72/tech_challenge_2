@@ -8,6 +8,9 @@ work.
 For the design reasoning behind the Terraform, the Helm chart and the
 Jenkins pipeline, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
+The AI conversations I used during the build are in the
+[AI conversation log](docs/ai-conversation/README.md).
+
 **Live application at time of submission:**
 `http://k8s-hellowor-hellowor-a7c7be98d6-1367070398.us-east-2.elb.amazonaws.com`
 
