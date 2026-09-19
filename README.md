@@ -1,696 +1,386 @@
-# Tech Challenge 2 — Containerization, IaC, Kubernetes & CI/CD
+# Tech Challenge 2 — Build Log
 
-A "Hello, World!" Flask application, containerized with Docker, provisioned onto **AWS EKS**
-with **Terraform**, exposed through an **ALB**, autoscaled with **HPA + Cluster Autoscaler**,
-and deployed continuously by **Jenkins** (`main`) or **GitHub Actions + Argo CD** (`gitops`).
+This is a step-by-step record of how I built the challenge, in the order I
+actually did it, with the output of each step underneath. It includes the
+things that broke and how I worked them out, because that was most of the
+work.
 
-**Live application:** `http://k8s-hellowor-hellowor-a7c7be98d6-1367070398.us-east-2.elb.amazonaws.com`
+For the design reasoning behind the Terraform, the Helm chart and the
+Jenkins pipeline, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
-> **Note on state:** this URL was live at the time of submission, and the screenshots in
-> `docs/screenshots/` were captured against the running deployment. The infrastructure has
-> since been destroyed with `terraform destroy` to avoid ongoing AWS charges (roughly
-> $8/day for the cluster, ALB, NAT gateway and Jenkins instance). The URL will no longer
-> resolve. Everything is reproducible from this repository by following
-> [Deploying the infrastructure](#deploying-the-infrastructure) — note that a new ALB is
-> allocated on each deploy, so the DNS name will differ.
+**Live application at time of submission:**
+`http://k8s-hellowor-hellowor-a7c7be98d6-1367070398.us-east-2.elb.amazonaws.com`
+
+The infrastructure has since been destroyed (see [Part 7](#part-7--teardown)),
+so this URL no longer resolves. Everything is reproducible from this repo.
+
+**Environment:** Windows 11, Git Bash (MINGW64), AWS region `us-east-2`.
 
 ---
 
 ## Contents
 
-- [Architecture](#architecture)
-- [Repository layout](#repository-layout)
-- [Prerequisites](#prerequisites)
-- [Environment setup](#environment-setup)
-- [Windows / Git Bash notes](#windows--git-bash-notes)
-- [Running locally](#running-locally)
-- [Deploying the infrastructure](#deploying-the-infrastructure)
-- [Deploying the application](#deploying-the-application)
-- [Scaling design](#scaling-design)
-- [Terraform explained](#terraform-explained)
-- [Jenkins pipeline explained](#jenkins-pipeline-explained)
-- [GitOps branch](#gitops-branch--github-actions--argo-cd)
-- [Verification and screenshots](#verification-and-screenshots)
-- [Troubleshooting](#troubleshooting)
-- [Teardown](#teardown)
+- [Part 1 — Repository and code review](#part-1--repository-and-code-review)
+- [Part 2 — Building the infrastructure](#part-2--building-the-infrastructure)
+- [Part 3 — Deploying the application](#part-3--deploying-the-application)
+- [Part 4 — Proving the autoscaling works](#part-4--proving-the-autoscaling-works)
+- [Part 5 — Jenkins CI/CD](#part-5--jenkins-cicd)
+- [Part 6 — GitOps with Argo CD](#part-6--gitops-with-argo-cd)
+- [Part 7 — Teardown](#part-7--teardown)
+- [What I would do differently](#what-i-would-do-differently)
 
 ---
 
-## Architecture
+## Part 1 — Repository and code review
 
-```text
-Developer ── git push ──► GitHub (main)
-                              │
-                              ▼
-                        Jenkins (EC2)
-                    build → smoke test → push
-                              │
-                              ▼
-                        Amazon ECR ──────────┐
-                              │              │
-                    helm upgrade --install   │ image pull
-                              │              │
-                              ▼              ▼
-   Internet ──► ALB ──► Ingress ──► Service ──► Pods (Deployment)
-                                                 ▲        ▲
-                                     HPA (cpu/mem 50%)    │
-                                                          │
-                                  Cluster Autoscaler (1 → 4 × t3.small)
+### Step 1 — Securing the repo before pushing
+
+I wrote the application, Dockerfile, Terraform and Helm chart with AI
+assistance before starting this run. Before pushing any of it, I checked
+what was about to leave my machine.
+
+The first thing I found was an EC2 private key sitting inside the
+`terraform/` directory. `.gitignore` covered it, but a gitignored secret is
+one `git add -f` away from being committed, so I moved it out of the repo
+entirely:
+
+```bash
+mkdir -p ~/.ssh/tc2
+mv terraform/ec2-lab-app.pem ~/.ssh/tc2/
+chmod 600 ~/.ssh/tc2/ec2-lab-app.pem
 ```
 
-The `gitops` branch swaps the Jenkins box for GitHub Actions (build + push) and Argo CD
-running inside the cluster (pull-based sync from Git).
+Then I verified that git would actually skip the dangerous files rather
+than assuming the `.gitignore` was right:
+
+```bash
+git check-ignore -v \
+  terraform/09-terraform.auto.tfvars \
+  terraform/tfplan \
+  terraform/.terraform/ \
+  terraform/ec2-lab-app.pem
+```
+
+All four matched. I also checked that nothing sensitive had ever been
+committed in an earlier session:
+
+```bash
+git log --all --oneline -- '*.pem' '*.tfvars' 'terraform/tfplan'
+```
+
+Empty output, so the history was clean.
+
+### Step 2 — Making the repo private and inviting my mentor
+
+The brief asks for a private repository shared with the mentor.
+
+![Private repository with mentor invited](docs/screenshots/github_collab_private.png)
+
+The repository has since been made public at my instructor's request so the
+screenshots in this document render for reviewers.
+
+### Step 3 — Separating the Jenkins and GitOps branches
+
+The brief wants Jenkins on the main branch and the GitOps approach on a
+separate one. Both sets of files had ended up on `main`, so I branched
+`gitops` and then removed the Argo CD and GitHub Actions files from `main`:
+
+```bash
+git checkout -b gitops
+git push -u origin gitops
+git checkout main
+git rm -r --cached argocd .github/workflows/ci.yml
+git commit -m "Remove GitOps config from main branch"
+git push
+```
+
+This caused a problem later — see [Step 21](#step-21--losing-the-gitops-files-to-a-merge).
+
+### Step 4 — Reviewing the config before spending money
+
+Rather than apply straight away, I read through the Terraform and Helm
+files against the requirements. An EKS cluster bills by the hour, so a
+config error found before `apply` is a lot cheaper than one found after.
+
+I found four things worth changing.
+
+**The memory request would have broken the HPA demo.** The deployment
+requested `128Mi`. A Flask app under gunicorn idles around 60–90 MiB, which
+against a 128Mi request is roughly 50–70% utilization with no traffic at
+all. Because the HPA takes whichever metric recommends more replicas, that
+would have pinned it at `maxReplicas` from startup and there would have
+been nothing to demonstrate. I raised it to `256Mi`:
+
+```yaml
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+```
+
+**metrics-server's argument was a string, not a list.** The Helm provider
+had `args` set to `"--kubelet-insecure-tls"`. The chart iterates over that
+value, so it needs Helm's list syntax with braces:
+
+```hcl
+set = [
+  {
+    name  = "args"
+    value = "{--kubelet-insecure-tls}"
+  }
+]
+```
+
+Without metrics-server serving, the HPA reads `<unknown>/50%` and nothing
+scales — so this would have blocked the entire scaling requirement.
+
+**The AWS account ID was hardcoded in the Jenkinsfile.** I changed it to
+resolve at runtime from the EC2 instance profile. A Jenkins `environment`
+block can't run shell steps, so the lookup needed its own stage:
+
+```groovy
+stage('Resolve Account') {
+    steps {
+        script {
+            env.AWS_ACCOUNT = sh(
+                script: 'aws sts get-caller-identity --query Account --output text',
+                returnStdout: true
+            ).trim()
+            env.REGISTRY = "${env.AWS_ACCOUNT}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
+            env.IMAGE    = "${env.REGISTRY}/${env.ECR_REPO}"
+        }
+    }
+}
+```
+
+**The cluster name had to match.** The Jenkinsfile hardcoded
+`CLUSTER_NAME = 'tc2-eks'`. I checked it against the Terraform variable
+default and they agreed, so no change — but a mismatch here would have
+failed the pipeline's kubectl stage.
+
+I committed these separately so the history shows the reasoning rather than
+one undifferentiated dump.
 
 ---
 
-## Repository layout
+## Part 2 — Building the infrastructure
 
-```text
-.
-├── app/
-│   ├── app.py                      # Flask: /, /healthz, /load
-│   ├── requirements.txt
-│   ├── Dockerfile
-│   └── .dockerignore
-├── terraform/                      # NN-name.tf, applied in read order
-│   ├── 00-provider.tf              # required_providers, S3 backend, provider config
-│   ├── 01-vpc.tf                   # VPC, subnets, NAT, ELB + autoscaler tags
-│   ├── 02-eks.tf                   # cluster, node group, access entries
-│   ├── 03-iam_irsa.tf              # IAM roles for service accounts
-│   ├── 04-addons.tf                # metrics-server, ALB controller, autoscaler
-│   ├── 05-ecr.tf                   # registry + lifecycle policy
-│   ├── 06-ec2-jenkins.tf           # Jenkins EC2, SG, instance profile, EIP
-│   ├── 06-jenkins_userdata.sh      # bootstraps Java/Jenkins/Docker/kubectl/Helm
-│   ├── 07-iam_github_oidc.tf       # OIDC role for GitHub Actions (gitops)
-│   ├── 07-sg_jenkins_eks.tf        # SG rule: Jenkins → EKS API on 443
-│   ├── 08-variables.tf
-│   ├── 09-terraform.auto.tfvars.example
-│   └── A-outputs.tf                # 'A-' sorts last
-├── helm/hello-world/
-│   ├── Chart.yaml
-│   ├── values.yaml
-│   └── templates/
-│       ├── _helpers.tpl
-│       ├── deployment.yaml
-│       ├── service.yaml
-│       ├── ingress.yaml
-│       ├── hpa.yaml
-│       └── serviceaccount.yaml
-├── k8s/loadtest.yaml               # load generator for the HPA demo
-├── argocd/                         # gitops branch only
-│   ├── install-values.yaml         # Helm values for Argo CD itself
-│   └── application.yaml            # the bootstrap Application
-├── Jenkinsfile                     # main branch
-├── .github/workflows/ci.yml        # gitops branch only
-├── Makefile                        # shortcuts for the commands below
-├── docs/
-│   ├── DOC-STYLE.md
-│   ├── mdcheck.py
-│   └── screenshots/
-├── .markdownlint.json
-├── .gitattributes                  # forces LF - see Windows notes
-├── PLAN.md
-└── README.md
-```
+### Step 5 — Confirming a clean starting point
 
-**Branching:** `main` = Jenkins. `gitops` = GitHub Actions + Argo CD. Kept separate on
-purpose. `argocd/` and `.github/workflows/ci.yml` exist only on `gitops`.
-
-> Merging `main` into `gitops` replays the commit that removed those files from `main` and
-> deletes them from `gitops` as well. Bring shared fixes across with `git cherry-pick` of
-> the specific commits instead.
-
-### Placeholders to replace before first run
-
-| File | Placeholder | Value |
-| --- | --- | --- |
-| `terraform/00-provider.tf` | `tc2-tfstate-<account-id>` | your S3 state bucket |
-| `terraform/09-terraform.auto.tfvars` | — | copy from `.example`, set `my_ip_cidr` |
-| `helm/hello-world/values.yaml` | `ACCOUNT_ID.dkr.ecr...` | overridden by CI; set for manual installs |
-| `argocd/application.yaml` | `cloudfighter72/tech_challenge_2` | your GitHub repo |
-
-The Jenkinsfile needs no account ID — it resolves one at runtime from the instance profile
-via `aws sts get-caller-identity`.
-
----
-
-## Windows / Git Bash notes
-
-Developed and run from Git Bash (MINGW64). Four things bite on Windows:
-
-**1. Line endings.** `.gitattributes` forces LF on every file Linux executes. Without it,
-`terraform/06-jenkins_userdata.sh` can reach the EC2 instance with CRLF and die with
-`bad interpreter: /bin/bash^M` — user-data fails silently and Jenkins never starts on
-port 8080. Set this once before cloning or committing:
+Before applying I checked I wasn't already being billed for a half-built
+cluster from an earlier attempt:
 
 ```bash
-git config --global core.autocrlf input
+aws eks list-clusters --region us-east-2
+aws autoscaling describe-auto-scaling-groups --region us-east-2
 ```
 
-If the repo was already committed with CRLF, renormalize:
+Both empty. Starting from zero.
 
-```bash
-git add --renormalize .
-git commit -m "normalize line endings to LF"
-```
-
-**2. Path conversion.** MSYS rewrites arguments that look like Unix paths. This bit during
-the HPA load test: `kubectl run ... -- /bin/sh -c ...` was rewritten to a Windows path and
-the container failed with
-`exec: "C:/Program Files/Git/usr/bin/sh": no such file or directory`. Export this in every
-shell you work in:
-
-```bash
-export MSYS_NO_PATHCONV=1
-```
-
-Or prefix a single command, or use `//bin/sh` — Git Bash strips the leading slash and the
-container receives `/bin/sh` correctly.
-
-**3. `make` is not installed by default.** Either install it —
-
-```bash
-winget install ezwinports.make      # or: choco install make / scoop install make
-```
-
-— or skip the Makefile entirely; every target is a one-line shell command you can read out
-of the file and run directly. The walkthrough below uses direct commands.
-
-**4. Docker Desktop must be running** before `docker build`, with WSL2 backend enabled.
-
----
-
-## Prerequisites
-
-| Tool | Version | Purpose |
-| --- | --- | --- |
-| AWS account | — | IAM user with admin-equivalent rights |
-| AWS CLI | v2 | authentication, kubeconfig |
-| Terraform | >= 1.6 | infrastructure |
-| kubectl | ~1.30 | cluster access |
-| Helm | v3 | chart deployment |
-| Docker | latest | image build |
-
----
-
-## Environment setup
-
-Terraform cannot bootstrap its own backend, so the state bucket comes first:
-
-```bash
-export ACCT=$(aws sts get-caller-identity --query Account --output text)
-
-aws s3api create-bucket --bucket tc2-tfstate-$ACCT --region us-east-2 \
-  --create-bucket-configuration LocationConstraint=us-east-2
-aws s3api put-bucket-versioning --bucket tc2-tfstate-$ACCT \
-  --versioning-configuration Status=Enabled
-```
-
-The bucket name embeds the account ID because S3 bucket names are globally unique. That is
-why the account ID appears in `00-provider.tf` and is not treated as a secret — it is an
-identifier, not a credential.
-
-Then set your variables:
-
-```bash
-cd terraform
-cp 09-terraform.auto.tfvars.example 09-terraform.auto.tfvars
-curl -s https://checkip.amazonaws.com      # set my_ip_cidr to this value + /32
-```
-
-`my_ip_cidr` restricts the Jenkins security group to your address on ports 22 and 8080.
-If your public IP changes, update it and re-apply or you will be locked out of the UI.
-
----
-
-## Running locally
-
-```bash
-docker build -t hello-world:local ./app
-docker run -d -p 8080:8080 hello-world:local
-curl localhost:8080
-curl localhost:8080/healthz
-```
-
-The image is `python:3.12-slim`, installs dependencies in a separate layer for caching,
-runs as a **non-root** user, and serves through `gunicorn` rather than the Flask dev server.
-`/load` burns CPU and holds memory for five seconds — it exists purely to give the HPA
-something to react to.
-
----
-
-## Deploying the infrastructure
-
-**Apply in two passes.** The Helm releases in `04-addons.tf` depend on `module.eks`, which
-guarantees the cluster resources exist but not that a node has joined and gone `Ready`.
-Applied in one pass, the add-on pods are scheduled against a cluster with no capacity and
-Helm times out. Provision the cluster first, wait for the node, then apply the rest:
+### Step 6 — Planning the apply
 
 ```bash
 cd terraform
 terraform init
-terraform apply -target=module.vpc -target=module.eks    # ~15-20 minutes
+terraform plan
 ```
 
-Terraform warns that `-target` is for exceptional use. That is expected; the unrestricted
-apply that follows reconciles everything.
+![Terraform plan, 64 resources to add](docs/screenshots/tfplan.png)
+
+64 resources: the VPC and its subnets, the EKS control plane and its KMS
+key, the node group, IRSA roles, ECR, and the Jenkins instance.
+
+### Step 7 — Applying in two passes
+
+I applied the VPC and cluster on their own first, rather than everything at
+once:
+
+```bash
+terraform apply -target=module.vpc -target=module.eks
+```
+
+The reason is that the three Helm releases in `04-addons.tf` depend on
+`module.eks`, which guarantees the *cluster resources* exist but not that a
+node has joined and gone `Ready`. In a single-pass apply, the add-on pods
+get scheduled against a cluster with no capacity and Helm times out after
+five minutes. Terraform warns that `-target` is for exceptional use, which
+is true, but the unrestricted apply afterwards reconciles everything.
+
+![Terraform apply pass 1 complete](docs/screenshots/tf_apply_complete.png)
+
+### Step 8 — Recovering from a dropped connection
+
+Partway through the second apply my internet connection dropped. Terraform
+lost the ability to write state and left a lock held in S3:
+
+```text
+Error: Failed to save state
+Error saving state: failed to upload state: dial tcp: lookup
+tc2-tfstate-185196963048.s3.us-east-2.amazonaws.com: no such host
+```
+
+Three different AWS endpoints failed DNS simultaneously, which pointed at my
+connection rather than at AWS. I confirmed that first:
+
+```bash
+nslookup sts.us-east-2.amazonaws.com
+aws sts get-caller-identity
+```
+
+Once both worked again, I recovered in this order — unlock, push the state
+Terraform had captured in memory but couldn't write, then verify:
+
+```bash
+terraform force-unlock 6381c380-cfc2-4178-2f51-3c9ce68a924a
+terraform state push errored.tfstate
+terraform plan
+```
+
+The plan came back **20 to add, 0 to change, 0 to destroy**, which told me
+nothing had been lost and the 64 resources from pass one were intact. If it
+had wanted to destroy anything I would have stopped and investigated rather
+than applying.
+
+### Step 9 — Waiting for the node, then the second pass
 
 ```bash
 aws eks update-kubeconfig --name tc2-eks --region us-east-2
-kubectl get nodes                       # wait for STATUS: Ready
-terraform apply                         # add-ons, ECR, Jenkins, OIDC
+kubectl get nodes
 ```
 
-Verify the platform came up:
+![First node Ready](docs/screenshots/node_ready.png)
+
+![Node Ready with kubeconfig context set](docs/screenshots/kubectl_get_nodes.png)
+
+One `t3.small` node, `Ready`, which is `min_size`. With capacity available I
+ran the unrestricted apply:
 
 ```bash
-kubectl get deploy -n kube-system       # metrics-server, ALB controller, autoscaler
-kubectl top nodes                       # numbers here mean metrics-server is serving
+terraform apply
 ```
 
-`kubectl top` returning an error means the HPA will report `<unknown>/50%` and nothing will
-scale. Fix that before going further.
+![Terraform apply pass 2 complete with outputs](docs/screenshots/tf_apply_complete_2.png)
 
-Confirm the autoscaler can discover its ASG — the tags are set on the node group, and
-propagation to the underlying Auto Scaling group is worth verifying rather than assuming:
+20 resources — the add-ons, ECR, the Jenkins EC2 instance and the GitHub
+OIDC role.
+
+### Step 10 — Verifying the platform before building on it
+
+Two checks here decide whether the rest of the challenge is possible:
+
+```bash
+kubectl get deploy -n kube-system
+kubectl top nodes
+```
+
+![kube-system deployments and node metrics](docs/screenshots/kube_nodes.png)
+
+All four deployments available, and `kubectl top` returning real numbers —
+which confirms the metrics-server argument fix from Step 4 worked. If this
+had errored, the HPA would never have functioned.
+
+I also confirmed Cluster Autoscaler could actually discover its Auto Scaling
+group. Tags are set on the node group in Terraform, but propagation to the
+underlying ASG is worth verifying rather than assuming:
 
 ```bash
 aws autoscaling describe-auto-scaling-groups --region us-east-2 \
   --query 'AutoScalingGroups[].[AutoScalingGroupName,Tags[?starts_with(Key,`k8s.io/cluster-autoscaler`)].Key]'
 ```
 
-Outputs: `cluster_name`, `ecr_repository_url`, `jenkins_url`, `jenkins_ssh`,
-`github_actions_role_arn`, `configure_kubectl`.
-
-### A note on Kubernetes versions
-
-`var.cluster_version` is pinned to `1.30`. EKS auto-upgraded the control plane to `1.31`
-during this project while the managed node group stayed on `1.30`. That skew is supported,
-and the variable was deliberately left at `1.30`: raising it to match queues a rolling
-replacement of every node, which is 10-20 minutes of churn for no functional gain. Raise it
-when you actually intend to upgrade the node group.
+Both `k8s.io/cluster-autoscaler/enabled` and
+`k8s.io/cluster-autoscaler/tc2-eks` were present. Without these, node
+scaling silently never happens.
 
 ---
 
-## Deploying the application
+## Part 3 — Deploying the application
 
-Terraform builds the platform; Helm deploys the app. CI/CD runs the same Helm command.
+### Step 11 — Building and pushing the image by hand
+
+I pushed one image manually before wiring up Jenkins, so there would be
+something in ECR for Helm to pull and I could separate "does the app work"
+from "does the pipeline work".
 
 ```bash
 ECR=$(terraform -chdir=terraform output -raw ecr_repository_url)
-
-aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin $ECR
+aws ecr get-login-password --region us-east-2 \
+  | docker login --username AWS --password-stdin $ECR
 docker build -t $ECR:v1 ./app
 docker push $ECR:v1
+```
 
+![Local docker build](docs/screenshots/ECR_image1.png)
+
+![Manual push to ECR](docs/screenshots/ECR_image2.png)
+
+### Step 12 — First Helm install
+
+```bash
 helm upgrade --install hello-world ./helm/hello-world \
   --namespace hello-world --create-namespace \
   --set image.repository=$ECR --set image.tag=v1 \
   --wait --timeout 5m
 ```
 
-The namespace matters: the Jenkins pipeline deploys to `hello-world`, so a manual install
-into a different namespace leaves you with two releases.
+I used the `hello-world` namespace deliberately because that is what the
+Jenkinsfile deploys into — installing into a different one would have left
+me with two separate releases.
 
 ```bash
-kubectl get ingress -n hello-world -w     # ALB takes 2-4 minutes to get an ADDRESS
+kubectl get pods,hpa -n hello-world
+kubectl get ingress -n hello-world -w
 ```
-
----
-
-## Scaling design
-
-The brief asks for four nodes with one always active, one pod per node, and an HPA allowing
-up to three pods per node. The last two are in tension — a hard one-pod-per-node constraint
-makes three pods per node impossible. Resolved as follows:
-
-| Requirement | Implementation |
-| --- | --- |
-| 4 nodes, 1 always active | `min_size=1`, `desired_size=1`, `max_size=4` in `02-eks.tf` |
-| `t3.small` nodes | `instance_types = ["t3.small"]` |
-| Scalable to 4 | Cluster Autoscaler adds nodes when pods are `Pending` |
-| 1 pod per node | `topologySpreadConstraints`, `maxSkew: 1`, key `kubernetes.io/hostname`, `whenUnsatisfiable: ScheduleAnyway` |
-| Max 3 pods per node | `maxReplicas: 12` (3 × 4 nodes) |
-| 50% CPU **or** 50% memory | Two HPA `Resource` metrics, each `averageUtilization: 50` |
-
-`ScheduleAnyway` rather than `DoNotSchedule` is deliberate: a hard constraint would leave
-pods permanently `Pending` past four replicas instead of stacking up. With two metrics the
-HPA takes whichever recommends *more* replicas, which is exactly the "CPU **or** memory"
-behaviour requested.
-
-**Kubernetes has no per-node replica cap.** "3 pods per node" is therefore expressed as a
-total ceiling of 12 replicas plus an even-spread constraint, not as a hard per-node limit.
-In the observed load test, 11 replicas landed 4 / 3 / 4 across three nodes — above three per
-node, because `maxSkew: 1` balances across whatever nodes exist rather than enforcing a
-cap. This is the expected behaviour of the chosen primitives.
-
-### Sizing the requests
-
-HPA percentages are computed against **requests**, so the Deployment sets them explicitly:
-
-```yaml
-resources:
-  requests: { cpu: 100m, memory: 256Mi }
-  limits:   { cpu: 500m, memory: 512Mi }
-```
-
-Omit the requests and the HPA reports `<unknown>/50%` forever.
-
-The memory request was raised from 128Mi to 256Mi. A Flask app under gunicorn idles around
-60-90 MiB; against a 128Mi request that is 47-70% utilization at rest, which would drive the
-HPA to `maxReplicas` before any load was applied and make the scaling demonstration
-meaningless. At 256Mi the observed idle figure is 21%, leaving CPU as the metric that
-actually responds to traffic.
-
-### Demonstrating it
-
-```bash
-MSYS_NO_PATHCONV=1 kubectl run load1 --rm -it --image=busybox --restart=Never -n hello-world -- \
-  //bin/sh -c "while true; do wget -q -O- http://hello-world > /dev/null; done"
-```
-
-A single sequential `wget` loop will not push a Flask pod past 50% of a 100m CPU request.
-Run three or four in separate terminals. Watch from another:
-
-```bash
-kubectl get hpa -n hello-world -w
-kubectl get nodes -w
-```
-
-`-w` accepts one resource type at a time, and nodes are cluster-scoped, so these need
-separate terminals.
-
-Observed behaviour: CPU peaked at 389%, replicas went 1 → 5 → 8 → 11, nodes went 1 → 3.
-Scale-down ran 11 → 5 → 3 → 2 → 1 over roughly eight minutes, then nodes were cordoned and
-removed. Scale-down is deliberately slower than scale-up: the HPA uses a 120-second
-stabilization window and the highest recommendation from the preceding five minutes. The
-autoscaler's `scale-down-unneeded-time` is set to `3m` (down from the 10m default) in
-`04-addons.tf` so the scale-down evidence does not cost a coffee break.
-
-**A note on node capacity:** with system pods only, a `t3.small` sits at roughly 50% memory —
-CoreDNS ×2, metrics-server, the ALB controller and the autoscaler leave about 700 MiB of
-~1.44 GiB allocatable. Three app pods at 256Mi exceed that, so pods go `Pending` sooner than
-a strict 3-per-node reading suggests and the autoscaler adds nodes earlier. That is the
-autoscaler working, not a failure. The ALB controller is pinned to `replicaCount: 1` to
-leave room.
-
----
-
-## Terraform explained
-
-**`00-provider.tf`** — pins provider versions and configures the S3 backend. The
-`kubernetes` and `helm` providers authenticate to the cluster this same config creates,
-using an `exec` block that fetches a fresh token on every apply rather than baking in a
-short-lived one — that is what makes re-applies work hours later.
-
-**`01-vpc.tf`** — `terraform-aws-modules/vpc/aws`. Public subnets for the ALB, private subnets
-for nodes, a single NAT gateway (cost over HA, ~$32/month instead of ~$64). The subnet tags
-matter more than they look: `kubernetes.io/role/elb=1` on public subnets is how the AWS Load
-Balancer Controller discovers where to place an internet-facing ALB. Missing tags is the
-usual reason an Ingress never gets an `ADDRESS`, and it fails silently.
-
-The `k8s.io/cluster-autoscaler/*` tags on the private subnets are inert — Cluster Autoscaler
-discovers Auto Scaling groups by **ASG** tag, not subnet tag. The tags that matter are on the
-node group in `02-eks.tf`. The subnet copies are harmless and left in place for parity.
-
-**`02-eks.tf`** — `terraform-aws-modules/eks/aws` v20. Control plane, OIDC provider (required
-for IRSA), and one managed node group sized 1/1/4 on `t3.small` with the AL2023 AMI.
-`enable_cluster_creator_admin_permissions` means kubectl works the moment the apply
-finishes. The node role gets `AmazonEC2ContainerRegistryReadOnly` so pods can pull from ECR,
-and `AmazonSSMManagedInstanceCore` so nodes are reachable without a key pair. The
-`access_entries` block maps the Jenkins IAM role to `AmazonEKSClusterAdminPolicy` — skipping
-this is the single most common cause of *"You must be logged in to the server"*.
-
-> **Do not** make `06-ec2-jenkins.tf` reference `module.eks`. `02-eks.tf` already reads
-> `aws_iam_role.jenkins.arn`, so `06-ec2-jenkins.tf` uses `var.cluster_name` instead. The
-> security group rule that bridges the two lives in its own file, `07-sg_jenkins_eks.tf`,
-> to keep that separation honest.
-
-**`03-iam_irsa.tf`** — IAM Roles for Service Accounts via
-`iam-role-for-service-accounts-eks`. Each controller assumes a scoped role through the
-cluster's OIDC provider instead of inheriting broad permissions from the node instance
-profile: `attach_load_balancer_controller_policy` for the ALB controller,
-`attach_cluster_autoscaler_policy` scoped to this cluster's ASGs for the autoscaler.
-
-**`04-addons.tf`** — three `helm_release` resources: **metrics-server** (feeds the HPA),
-**AWS Load Balancer Controller** (turns Ingress objects into real ALBs), **Cluster
-Autoscaler** (adds and removes nodes). Managing them in Terraform keeps the whole platform
-reproducible from a single apply — subject to the two-pass ordering described above.
-
-metrics-server needs `--kubelet-insecure-tls` passed as a **list**, not a scalar. In the
-Helm provider's `set` block that is written `value = "{--kubelet-insecure-tls}"`; the braces
-are Helm's list syntax. Without them the chart iterates over a string and the container spec
-comes out malformed.
-
-**`05-ecr.tf`** — private registry, scan-on-push, lifecycle policy keeping the last 10 images,
-`force_delete = true` so `terraform destroy` isn't blocked by stored images.
-
-**`06-ec2-jenkins.tf` / `06-jenkins_userdata.sh`** — `t3.medium` EC2 with an Elastic IP and a
-security group restricted to the operator's IP on 22/8080. `user_data` installs Java,
-Jenkins, Docker (adding `jenkins` to the `docker` group), AWS CLI v2, kubectl and Helm, then
-pre-seeds a kubeconfig for the `jenkins` user. The instance profile grants ECR push and
-`eks:DescribeCluster`; actual in-cluster rights come from the EKS access entry, not IAM.
-Jenkins therefore stores **no** AWS credentials.
-
-**`07-sg_jenkins_eks.tf`** — the cluster's primary security group allows traffic only from
-itself. Jenkins runs on its own security group outside the cluster, so `kubectl` and `helm`
-hang on the private API endpoint until an explicit ingress rule on 443 is added. Without
-this the pipeline fails at the **Configure kubectl** stage with an i/o timeout.
-
-**`07-iam_github_oidc.tf`** — GitHub OIDC provider plus a role trusted only by
-`repo:<owner>/<repo>:*`, used by the `gitops` workflow so Actions never needs static keys.
-
-**Design notes:** community modules over hand-rolled resources; IRSA over node-level IAM
-(least privilege); everything but the state backend codified.
-
----
-
-## Jenkins pipeline explained
-
-`Jenkinsfile`, declarative, runs on `main`:
-
-| Stage | Action |
-| --- | --- |
-| **Resolve Account** | `aws sts get-caller-identity` → sets `AWS_ACCOUNT`, `REGISTRY`, `IMAGE` |
-| **Checkout** | Clone the triggering commit |
-| **Build Image** | `docker build` tagged `${BUILD_NUMBER}` and `latest` |
-| **Smoke Test** | Run the container, curl `/healthz` and `/`, fail before anything is pushed |
-| **Push to ECR** | `aws ecr get-login-password` via the instance profile, push both tags |
-| **Configure kubectl** | `aws eks update-kubeconfig`, then `kubectl get nodes` |
-| **Deploy with Helm** | `helm upgrade --install --wait --timeout 5m` with the new tag |
-| **Verify Rollout** | `kubectl rollout status`, print the live ALB URL |
-| **post** | `docker rmi` local images; on failure, dump recent namespace events |
-
-Three choices worth defending. **The account ID is resolved at runtime**, not committed —
-an `environment` block cannot run `sh` steps, so the lookup lives in its own first stage.
-**Build-number tags, never bare `latest`** — deploying by `latest` makes rollbacks guesswork.
-And **`helm upgrade --install` is idempotent**, so the first run and the hundredth run are
-the same command; Helm's release history gives you `helm rollback` for free.
-
-**Trigger:** GitHub webhook to `http://<jenkins-ip>:8080/github-webhook/`, or SCM polling
-(`H/5 * * * *`) if the host isn't publicly reachable.
-
-**Jenkins setup:** unlock with
-`sudo cat /var/lib/jenkins/secrets/initialAdminPassword`, install the suggested plugins,
-then create a Pipeline job with **Pipeline script from SCM**, Git, this repo, branch
-`*/main`, script path `Jenkinsfile`.
-
-> This repository is **private**. The Jenkins job and Argo CD both need read credentials —
-> a GitHub personal access token added as a Jenkins credential and selected in the job's
-> SCM configuration. Builds #1 and #2 in the screenshots were run while the repository was
-> still public and required no credential.
-
-Before the first build, confirm the agent has what the pipeline needs:
-
-```bash
-sudo -u jenkins docker ps
-sudo -u jenkins kubectl get nodes
-```
-
----
-
-## GitOps branch — GitHub Actions + Argo CD
-
-On `gitops`, push-based CD is replaced by pull-based CD.
-
-**CI — `.github/workflows/ci.yml`** (on push to `gitops`):
-
-1. Assume the AWS role via **OIDC** (`permissions: id-token: write`) — no stored keys
-2. `aws-actions/amazon-ecr-login`
-3. Build and push tagged with `github.sha`
-4. Rewrite `image.repository` and `image.tag` in `helm/hello-world/values.yaml` and commit
-   back with `[skip ci]` — the `if:` guard stops that commit re-triggering the workflow
-
-**CD — Argo CD**, installed in-cluster and bootstrapped once:
-
-```bash
-helm repo add argo https://argoproj.github.io/argo-helm
-helm upgrade --install argocd argo/argo-cd -n argocd --create-namespace \
-  -f argocd/install-values.yaml --wait --timeout 10m
-```
-
-Because the repository is private, Argo CD needs a credential before it can read the chart.
-Register one as a labelled secret in the `argocd` namespace:
-
-```bash
-kubectl create secret generic tc2-repo -n argocd \
-  --from-literal=type=git \
-  --from-literal=url=https://github.com/cloudfighter72/tech_challenge_2.git \
-  --from-literal=username=<github-username> \
-  --from-literal=password=<classic-pat-with-repo-scope>
-
-kubectl label secret tc2-repo -n argocd argocd.argoproj.io/secret-type=repository
-```
-
-Use a **classic** personal access token with the top-level `repo` scope. A fine-grained
-token must additionally be granted access to this specific repository and given at least
-`Contents: Read`; without that, Argo CD reports
-`authorization failed: Write access to repository not granted`, which is misleading — it
-only ever needs read.
-
-Then bootstrap the Application:
-
-```bash
-kubectl apply -f argocd/application.yaml
-kubectl get application -n argocd
-```
-
-If the status sits at `Unknown` after a credential change, Argo CD is serving a cached
-failure. Restart the repo server and force a refresh:
-
-```bash
-kubectl rollout restart deploy argocd-repo-server -n argocd
-kubectl patch application hello-world -n argocd --type merge \
-  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
-```
-
-`install-values.yaml` sets `server.insecure: true` so TLS terminates at the ALB — without it
-the ALB health check fails against an HTTPS-only pod — and trims resource requests to fit
-the `t3.small` fleet. It also enables an Ingress, so Argo CD provisions its **own** ALB
-alongside the application's; both must be removed at teardown. For local access, note that
-insecure mode serves plain HTTP, so the port-forward maps to port 80, not 443:
-
-```bash
-kubectl port-forward service/argocd-server -n argocd 8080:80
-# then browse to http://localhost:8080 (not https)
-kubectl -n argocd get secret argocd-initial-admin-secret \
-  -o jsonpath="{.data.password}" | base64 -d
-```
-
-`application.yaml` watches `targetRevision: gitops`, path `helm/hello-world`, with
-`automated` sync: `prune` deletes resources removed from Git, `selfHeal` reverts manual
-`kubectl` drift.
-
-**Why this differs from Jenkins:** Git is the single source of truth, cluster credentials
-never leave the cluster, and deployed state is auditable from commit history. The trade-off
-is an extra indirection — the image tag must be committed back before anything deploys.
-
-Set repo secret `AWS_ROLE_ARN` to the `github_actions_role_arn` Terraform output, and set
-**Settings → Actions → General → Workflow permissions** to *Read and write*, which the
-tag-bump commit requires.
-
-Note: editors with Kubernetes schema validation flag `argocd/application.yaml` with
-"apiVersion and/or kind does not reference a known schema". `argoproj.io/v1alpha1` is a CRD
-installed by Argo CD itself, so the warning is expected until Argo CD is running.
-
-### Status at submission
-
-Argo CD is installed, authenticated against this private repository, and reporting
-`Synced` / `Healthy` against the `gitops` branch, managing the live Deployment, Service,
-Ingress, HPA and ServiceAccount. The pull-based CD half of the GitOps model is working and
-is evidenced below.
-
-The GitHub Actions half fails at the OIDC step with
-`Not authorized to perform sts:AssumeRoleWithWebIdentity`. The IAM configuration was
-verified and is correct as far as it can be inspected from the AWS side: the provider
-exists at `token.actions.githubusercontent.com`, its `ClientIDList` contains
-`sts.amazonaws.com`, and the role's trust policy matches
-`repo:cloudfighter72/tech_challenge_2:*` with the `sts.amazonaws.com` audience. Resolving it
-requires decoding the `sub` claim from a live workflow token to find where the mismatch
-actually is, which was not pursued within the challenge window. Image build and push to ECR
-are demonstrated by the Jenkins pipeline, which performs the same operations against the
-same registry.
-
----
-
-## Verification and screenshots
-
-```bash
-kubectl get nodes -o wide                    # node count and instance type
-kubectl get pods -o wide -n hello-world      # pod distribution across nodes
-kubectl get hpa -n hello-world               # cpu/mem against 50%
-helm history hello-world -n hello-world      # deployment history
-```
-
-Screenshots capture point-in-time state during the load test and CI/CD runs — for example,
-11 pods across 3 nodes at peak, against a cluster that returns to 1 node and 1 replica at
-rest. They are evidence of behaviour under load, not of steady state.
-
-### Repository and submission
-
-Private repository with the mentor invited as a collaborator.
-
-![Private repository with mentor invited](docs/screenshots/github_collab_private.png)
-
-### Infrastructure
-
-Terraform plan before the first apply — 64 resources, including the cluster KMS key and
-node group validation.
-
-![Terraform plan, 64 resources to add](docs/screenshots/tfplan.png)
-
-First pass complete: VPC and EKS control plane only.
-
-![Terraform apply pass 1 complete](docs/screenshots/tf_apply_complete.png)
-
-The node reaches `Ready` before the add-ons are applied. This ordering is the whole reason
-for the two-pass apply.
-
-![First node Ready](docs/screenshots/node_ready.png)
-
-![Node Ready at min size with kubeconfig context](docs/screenshots/kubectl_get_nodes.png)
-
-Second pass: add-ons, ECR, Jenkins and the GitHub OIDC role — 20 resources.
-
-![Terraform apply pass 2 complete with outputs](docs/screenshots/tf_apply_complete_2.png)
-
-All four `kube-system` deployments available, and `kubectl top nodes` returning real
-figures — the prerequisite for the HPA to function at all.
-
-![kube-system deployments and node metrics](docs/screenshots/kube_nodes.png)
-
-### Application
-
-Local image build: layered dependency install, non-root `appuser`.
-
-![Local docker build](docs/screenshots/ECR_image1.png)
-
-Manual push to ECR as a fallback image before CI/CD exists.
-
-![Manual push to ECR](docs/screenshots/ECR_image2.png)
-
-First Helm release: one pod running, HPA reporting real percentages, Ingress resolved to an
-ALB hostname.
 
 ![Pod, HPA and Ingress after first Helm install](docs/screenshots/Helm_ALB.png)
 
-The application served through the ALB.
+The HPA reads `cpu: 1%/50%, memory: 21%/50%`. That memory figure is the
+direct result of the 256Mi change in Step 4 — at 128Mi it would have been
+sitting around 42% and the autoscaler would have started scaling on its own
+before I applied any load.
+
+### Step 13 — The application, live
 
 ![Hello World served through the ALB](docs/screenshots/browser_hello_world.png)
 
-The ALB itself — internet-facing, spanning two availability zones.
-
 ![ALB active in the EC2 console](docs/screenshots/ALB_console.png)
 
-Target group health. The registered target is a **pod IP**, not a node — confirming
-`alb.ingress.kubernetes.io/target-type: ip` is in effect.
+I also checked the target group rather than trusting that the load balancer
+existing meant traffic was flowing:
 
 ![Target group with one healthy pod IP](docs/screenshots/ALB_target_group.png)
 
-### Scaling
+The registered target is a **pod IP** (`10.0.27.170:8080`), not a node,
+which confirms `alb.ingress.kubernetes.io/target-type: ip` is working as
+configured.
 
-Three parallel load generators. One sequential `wget` loop is not enough to push a Flask pod
-past 50% of a 100m CPU request.
+---
+
+## Part 4 — Proving the autoscaling works
+
+### Step 14 — Git Bash mangled the load test command
+
+My first attempt at a load generator failed before the container started:
+
+```text
+OCI runtime create failed: unable to start container process:
+exec: "C:/Program Files/Git/usr/bin/sh": no such file or directory
+```
+
+This is MSYS path conversion — Git Bash saw `/bin/sh` in the arguments and
+helpfully rewrote it as a Windows path before kubectl ever sent it. It looks
+like a cluster problem but is purely a shell quirk. Two fixes work:
+`MSYS_NO_PATHCONV=1`, or `//bin/sh`, because Git Bash strips the leading
+slash and the container receives the correct path. I used both:
+
+```bash
+MSYS_NO_PATHCONV=1 kubectl run load1 --rm -it --image=busybox \
+  --restart=Never -n hello-world -- \
+  //bin/sh -c "while true; do wget -q -O- http://hello-world > /dev/null; done"
+```
 
 ![Load generator 1](docs/screenshots/load_test_01.png)
 
@@ -698,191 +388,448 @@ past 50% of a 100m CPU request.
 
 ![Load generator 3](docs/screenshots/load_test_03.png)
 
-HPA scale-up. CPU peaks at 389% of target, replicas climb 1 → 5 → 8, then utilization falls
-as the new pods absorb the load. Memory stays flat at 21% throughout — CPU is the driving
-metric, which is what the 256Mi request was sized to allow.
+I ran three in separate terminals. One sequential `wget` loop does not
+generate enough load to push a Flask pod past 50% of a 100m CPU request.
+
+### Step 15 — Watching the HPA scale up
+
+```bash
+kubectl get hpa -n hello-world -w
+```
 
 ![HPA scaling up under load](docs/screenshots/load_test_works.png)
 
-Cluster Autoscaler adds nodes as pods become unschedulable, then cordons and drains them on
-the way back down.
+The whole behaviour is visible in one frame: baseline at 1%, CPU spiking to
+389% of target, replicas climbing 1 → 5 → 8, then utilization dropping back
+as the new pods absorb the traffic and settling around 41–51% as the HPA
+converges. Memory stays flat at 21% throughout, which confirms CPU is the
+metric actually driving the scaling.
+
+### Step 16 — Node autoscaling and pod distribution
+
+`-w` only accepts one resource type at a time, and nodes are cluster-scoped,
+so I watched nodes in a separate terminal:
+
+```bash
+kubectl get nodes -w
+kubectl get pods -n hello-world -o wide
+```
 
 ![Nodes scaling 1 to 3 and draining](docs/screenshots/node_scaling1.png)
 
-The Auto Scaling group at desired capacity 3, within the configured 1–4 limits.
+![11 pods distributed across three nodes](docs/screenshots/ALB_scaling.png)
+
+Eleven pods distributed 4 / 3 / 4 across three nodes. The
+`topologySpreadConstraints` with `maxSkew: 1` balance across nodes rather
+than stacking onto one.
+
+This is more than the "3 pods per node" the brief describes, and it is worth
+being explicit about why. Kubernetes has no per-node replica cap. I
+expressed the requirement as a total ceiling of 12 replicas (3 × 4 nodes)
+plus an even-spread constraint. Using a hard `DoNotSchedule` anti-affinity
+on hostname would enforce one pod per node, but it would also make three
+pods per node impossible — the two parts of the requirement contradict each
+other, and this is the reading that satisfies both as closely as the
+primitives allow.
 
 ![ASG at desired capacity 3](docs/screenshots/ASG_console.png)
 
-Pod distribution at peak: 11 replicas spread 4 / 3 / 4 across three nodes. The
-`topologySpreadConstraints` balance rather than stack.
+The Auto Scaling group at desired capacity 3, within its configured 1–4
+limits.
 
-![11 pods distributed across three nodes](docs/screenshots/ALB_scaling.png)
-
-Scale-down. The HPA steps 11 → 5 → 3 → 2 → 1 rather than dropping at once, because it uses a
-120-second stabilization window and the highest recommendation from the preceding five
-minutes.
+### Step 17 — Scale-down
 
 ![HPA scaling back down to one replica](docs/screenshots/ALB_scaling2.png)
 
-### CI/CD — Jenkins
+After stopping the load, the HPA stepped down 11 → 5 → 3 → 2 → 1 over about
+eight minutes rather than dropping at once. That is the 120-second
+stabilization window combined with the HPA using the highest recommendation
+from the preceding five minutes. The node screenshot above also shows
+Cluster Autoscaler cordoning a node (`SchedulingDisabled`) and draining it
+before termination, rather than killing it outright.
 
-The Jenkins user reaching the EKS API — verification that the security group rule in
-`07-sg_jenkins_eks.tf` works. Without it the pipeline hangs at **Configure kubectl**.
+I initially thought the delay meant something was broken. It is the
+documented behaviour.
+
+---
+
+## Part 5 — Jenkins CI/CD
+
+This part took the longest, and none of it was the pipeline itself.
+
+### Step 18 — Jenkins would not start
+
+```bash
+curl -I http://3.139.227.252:8080
+curl: (7) Failed to connect
+```
+
+I checked the security group first since it was quickest to rule out — it
+allowed 8080 from `70.191.10.145/32`, and `curl -s https://checkip.amazonaws.com`
+confirmed that was still my address. So the network was fine and Jenkins
+itself was not running.
+
+SSM Session Manager reported the instance as not connected, so I used SSH:
+
+```bash
+ssh -i ~/.ssh/tc2/ec2-lab-app.pem ec2-user@3.139.227.252
+sudo systemctl status jenkins
+```
+
+The service had failed and restarted five times before giving up. The cloud-init
+log showed Jenkins, Docker, kubectl, Helm and the AWS CLI had all installed
+successfully, so the install wasn't the problem. Running the binary directly
+gave the answer:
+
+```bash
+sudo /usr/bin/jenkins 2>&1 | head -20
+```
+
+```text
+Running with Java 17 from /usr/lib/jvm/java-17-amazon-corretto.x86_64,
+which is older than the minimum required version (Java 21).
+Supported Java versions are: [21, 25]
+```
+
+Amazon Linux 2023 pulled in Java 17 as a dependency, but Jenkins 2.568
+requires 21 or 25. The user-data script never pinned a version:
+
+```bash
+sudo dnf install -y java-21-amazon-corretto-headless
+sudo alternatives --set java /usr/lib/jvm/java-21-amazon-corretto/bin/java
+sudo systemctl restart jenkins
+```
+
+### Step 19 — Jenkins could not reach the cluster
+
+With Jenkins running, I checked the pipeline's dependencies before touching
+the UI. Docker worked. kubectl returned something strange:
+
+```text
+couldn't get current server API group list: <html><head>...
+Authentication required
+You are authenticated as: anonymous
+```
+
+That is Jenkins' own web UI. The `jenkins` user's kubeconfig was empty — the
+user-data script had run `chown` on `.kube` *after* `update-kubeconfig`
+rather than before, so the write failed with a permission error — and
+kubectl had fallen back to its historical default of `localhost:8080`, where
+Jenkins happened to be listening.
+
+Regenerating the kubeconfig moved the problem along but didn't solve it:
+
+```text
+dial tcp 10.0.21.190:443: i/o timeout
+```
+
+Now kubectl was reaching the real EKS endpoint and timing out. The cluster's
+primary security group only permits traffic from itself:
+
+```bash
+aws ec2 describe-security-groups --group-ids sg-07707987cd39db17a \
+  --region us-east-2 --query 'SecurityGroups[].IpPermissions'
+```
+
+Jenkins runs on its own security group, outside the cluster, so nothing it
+sent was allowed in. I added the rule in Terraform rather than clicking it
+into the console, in its own file to keep the dependency direction clean:
+
+```hcl
+resource "aws_security_group_rule" "cluster_api_from_jenkins" {
+  type                     = "ingress"
+  from_port                = 443
+  to_port                  = 443
+  protocol                 = "tcp"
+  security_group_id        = module.eks.cluster_primary_security_group_id
+  source_security_group_id = aws_security_group.jenkins.id
+  description              = "Jenkins to EKS API"
+}
+```
+
+Applying it surfaced something unrelated: the plan wanted to change 6
+resources, including downgrading the EKS control plane. EKS had
+auto-upgraded the control plane to 1.31 while my `cluster_version` variable
+still said 1.30, and AWS rejects downgrades outright. Rather than accept a
+rolling replacement of every node for no functional gain, I applied only the
+rule I wanted:
+
+```bash
+terraform apply -target=aws_security_group_rule.cluster_api_from_jenkins
+```
+
+Then verified from the instance:
 
 ![Jenkins user running kubectl against the cluster](docs/screenshots/ssh_ec2.png)
 
-Build #1, checked out at the triggering commit.
+### Step 20 — Running the pipeline
+
+With every dependency verified, I set up the job: Pipeline script from SCM,
+Git, branch `*/main`, script path `Jenkinsfile`.
 
 ![Jenkins build 1 status](docs/screenshots/Jenkins_UI_build.png)
 
 ![Jenkins build 1 stage view](docs/screenshots/Jenkins_UI_stages.png)
 
-Builds #1 and #2, every stage green. Build #2 picked up two commits and completed in 34
-seconds.
-
-![Jenkins builds 1 and 2, all stages green](docs/screenshots/Jenkins_build_2.png)
-
-The **Push to ECR** stage. Authentication comes from the EC2 instance profile — no AWS
-credentials are stored in Jenkins.
+Build #1 passed every stage on the first run. The console output for the two
+stages that matter:
 
 ![Jenkins pushing the image to ECR](docs/screenshots/Jenkins_ecr_push.png)
 
-The **Deploy with Helm** and **Verify Rollout** stages. `REVISION: 2` shows the pipeline
-upgraded the existing release rather than creating a parallel one, and the pipeline echoes
-the live URL.
+Authentication here comes from the EC2 instance profile — Jenkins stores no
+AWS credentials.
 
 ![Jenkins helm upgrade and rollout verification](docs/screenshots/Jenkins_helm_upgrade.png)
 
-ECR after both builds: `v1` from the manual push, then `1` and `2, latest` from Jenkins,
-each with a distinct digest and a "last pulled" timestamp proving the cluster consumed them.
+`REVISION: 2` shows the pipeline upgraded the release I created manually in
+Step 12 rather than creating a parallel one, which is the point of using
+`helm upgrade --install`.
+
+A green pipeline only proves the pipeline runs, not that it deploys. So I
+changed the application's greeting, pushed, and ran it again:
+
+![Jenkins builds 1 and 2, all stages green](docs/screenshots/Jenkins_build_2.png)
 
 ![ECR image tags with timestamps](docs/screenshots/AWS_ECR_tags.png)
 
-The deployed change, live. `deployed by Jenkins` and `version build-2` confirm the pipeline
-delivers code changes to the running cluster — not just that it exits zero.
+ECR now shows `v1` from my manual push at 10:47, `1` from build #1 at 12:34,
+and `2, latest` from build #2 at 12:59 — each with a distinct digest and a
+"last pulled" timestamp showing the cluster actually consumed them.
 
 ![Application showing the Jenkins-deployed change](docs/screenshots/browser_deployed_by_Jenkins.png)
 
-### CI/CD — GitOps
+"deployed by Jenkins" and `version build-2` on the live URL. That is the
+pipeline delivering a code change to a running cluster.
 
-Argo CD tracking the `gitops` branch at `helm/hello-world`, `Healthy` and `Synced`.
+---
 
-![Argo CD applications list showing hello-world synced](docs/screenshots/argo_login.png)
+## Part 6 — GitOps with Argo CD
 
-The application resource tree. Argo CD owns the Deployment, Service, Ingress, HPA and
-ServiceAccount, and the ReplicaSet history shows the revisions it has managed through.
+### Step 21 — Losing the GitOps files to a merge
 
-![Argo CD resource tree for hello-world](docs/screenshots/argo_view.png)
+The `gitops` branch was still at its original commit and needed the fixes
+from Step 4. I merged `main` into it, which was a mistake:
 
-The classic personal access token created for Argo CD's repository access, confirmed by
-GitHub's notification. A classic token with `repo` scope is required here — a fine-grained
-token fails with a misleading "Write access not granted" error.
+```bash
+git checkout gitops
+git merge main
+cat .github/workflows/ci.yml
+# cat: .github/workflows/ci.yml: No such file or directory
+```
+
+Removing those files from `main` in Step 3 was recorded as a deletion, and
+merging replayed that deletion onto the branch whose entire purpose was to
+keep them. Recovering was straightforward since nothing is ever really lost
+in git:
+
+```bash
+git checkout d8b2b91 -- .github/workflows/ci.yml argocd/
+git add .github/workflows/ci.yml argocd/
+git commit -m "Restore GitOps files removed by merge from main"
+```
+
+The correct approach for bringing shared fixes across two intentionally
+divergent branches is `git cherry-pick` of the specific commits, not a
+merge.
+
+### Step 22 — Installing Argo CD
+
+```bash
+helm repo add argo https://argoproj.github.io/argo-helm
+helm upgrade --install argocd argo/argo-cd -n argocd --create-namespace \
+  -f argocd/install-values.yaml --wait --timeout 10m
+```
+
+### Step 23 — The token that said the wrong thing
+
+With the repository private, Argo CD needs a credential to read the chart. I
+created a fine-grained personal access token and registered it:
+
+```bash
+kubectl create secret generic tc2-repo -n argocd \
+  --from-literal=type=git \
+  --from-literal=url=https://github.com/cloudfighter72/tech_challenge_2.git \
+  --from-literal=username=cloudfighter72 \
+  --from-literal=password=<token>
+kubectl label secret tc2-repo -n argocd argocd.argoproj.io/secret-type=repository
+```
+
+The application came back `Unknown`:
+
+```text
+failed to list refs: authorization failed:
+Write access to repository not granted.
+```
+
+That message is misleading — Argo CD only needs read access. It is GitHub's
+generic rejection for a token that cannot authenticate at all. Fine-grained
+tokens require the specific repository to be granted explicitly and
+permissions set individually, which is easy to get wrong. I replaced it with
+a classic token carrying the top-level `repo` scope:
 
 ![GitHub notification confirming the classic PAT was created](docs/screenshots/argocd_email.png)
 
-The same state from the CLI after a hard refresh.
+Swapping the secret alone didn't fix it, because the repo server caches
+authentication failures:
+
+```bash
+kubectl rollout restart deploy argocd-repo-server -n argocd
+kubectl patch application hello-world -n argocd --type merge \
+  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+```
 
 ![kubectl get application showing Synced and Healthy](docs/screenshots/argocd_health.png)
 
-The GitHub Actions half, failing at the OIDC credential step — see
-[Status at submission](#status-at-submission) for the diagnosis.
+### Step 24 — Argo CD managing the deployment
+
+Reaching the UI needed one more adjustment. `install-values.yaml` sets
+`server.insecure: true` so that TLS terminates at the ALB rather than the
+pod, which means the port-forward has to target port 80 over plain HTTP —
+forwarding to 443 and browsing over `https://` resets the connection,
+because there is no TLS listener on the pod to answer it:
+
+```bash
+kubectl port-forward service/argocd-server -n argocd 8080:80
+```
+
+![Argo CD applications list showing hello-world synced](docs/screenshots/argo_login.png)
+
+![Argo CD resource tree for hello-world](docs/screenshots/argo_view.png)
+
+Argo CD owns the Deployment, Service, Ingress, HPA and ServiceAccount, with
+the ReplicaSet history showing the revisions it has managed through.
+
+### Step 25 — The GitHub Actions half, unresolved
+
+The CI side of the GitOps branch does not work. It fails at the OIDC
+credential step:
 
 ![GitHub Actions workflow run failing](docs/screenshots/git_ops_fail.png)
 
-### Teardown
+```text
+Error: Could not assume role with OIDC:
+Not authorized to perform sts:AssumeRoleWithWebIdentity
+```
 
-Argo CD and the application uninstalled first, so the controller releases both load
-balancers before Terraform touches the VPC. Note that Argo CD's CRDs are retained by its
-own resource policy — they are removed with the namespace.
+I verified everything inspectable from the AWS side:
+
+```bash
+aws iam get-role --role-name tc2-github-actions \
+  --query 'Role.AssumeRolePolicyDocument'
+aws iam get-open-id-connect-provider \
+  --open-id-connect-provider-arn arn:aws:iam::185196963048:oidc-provider/token.actions.githubusercontent.com
+```
+
+The provider exists at `token.actions.githubusercontent.com`, its
+`ClientIDList` contains `sts.amazonaws.com`, and the role's trust policy
+matches `repo:cloudfighter72/tech_challenge_2:*` with the correct audience
+condition. The workflow requests `id-token: write`, and the `AWS_ROLE_ARN`
+repository secret exists. I also set Workflow permissions to "Read and
+write", which the tag-bump commit needs.
+
+Every component checks out individually and the assumption is still
+rejected. Resolving it properly means adding a debug step that prints the
+decoded `sub` claim from a live workflow token and comparing it against the
+trust policy character by character, rather than continuing to guess at
+configuration that already looks correct. I ran out of time in the
+challenge window before doing that.
+
+What this means in practice: the pull-based CD half of GitOps works and is
+demonstrated above. The image build and push to ECR, which is what the
+Actions workflow would do, is demonstrated by the Jenkins pipeline
+performing the same operations against the same registry.
+
+---
+
+## Part 7 — Teardown
+
+### Step 26 — Releasing the load balancers first
+
+Order matters here. Terraform has no knowledge of the ALBs — they were
+created by the AWS Load Balancer Controller in response to Ingress objects —
+so destroying the VPC while they are still attached stalls on a dependency
+Terraform cannot see. There were two: the application's and Argo CD's own.
+
+```bash
+kubectl delete -f argocd/application.yaml
+helm uninstall argocd -n argocd
+helm uninstall hello-world -n hello-world
+kubectl delete ingress --all -A
+```
 
 ![Argo CD Application deleted and Helm releases uninstalled](docs/screenshots/argo_teardown.png)
 
-Both ALBs gone. Terraform has no knowledge of these — they were created by the AWS Load
-Balancer Controller in response to Ingress objects — so destroying the VPC while they are
-still attached stalls on a dependency Terraform cannot see. The empty result here is the
-signal that it is safe to continue.
+Then I waited for both to actually disappear rather than assuming:
+
+```bash
+aws elbv2 describe-load-balancers --region us-east-2 \
+  --query 'LoadBalancers[].LoadBalancerName' --output text
+```
 
 ![No load balancers remaining in the region](docs/screenshots/ALB_teardown.png)
 
-`terraform destroy` complete: 85 resources removed, ending with the VPC itself.
-
-![terraform destroy complete, 85 resources destroyed](docs/screenshots/tf_destroy.png)
-
-No EKS clusters remain in `us-east-2`.
-
-![aws eks list-clusters returning an empty list](docs/screenshots/eks_teardown.png)
-
-All three EC2 instances terminated — the two `t3.small` worker nodes and the `t3.medium`
-Jenkins controller. With the cluster, both ALBs, the NAT gateway and these instances gone,
-the project incurs no further charges.
-
-![EC2 console showing all instances terminated](docs/screenshots/ec2_terminated.png)
-
----
-
-## Troubleshooting
-
-Issues actually hit during this build, and their fixes:
-
-| Symptom | Cause | Fix |
-| --- | --- | --- |
-| Jenkins service fails to start, restarts 5× | Jenkins 2.568 requires Java 21; AL2023 installed Java 17 | `dnf install -y java-21-amazon-corretto-headless`, then restart |
-| Jenkins `kubectl` returns Jenkins' own login HTML | Empty kubeconfig, so kubectl fell back to `localhost:8080` | `sudo -u jenkins aws eks update-kubeconfig --name tc2-eks --region us-east-2` |
-| Jenkins `kubectl` times out on `10.x.x.x:443` | Cluster SG allows only itself; Jenkins SG not permitted | Add the 443 ingress rule in `07-sg_jenkins_eks.tf` |
-| `Permission denied: /var/lib/jenkins/.kube/config` in user-data | `chown` ran after `update-kubeconfig`, not before | Reorder the two steps in `06-jenkins_userdata.sh` |
-| Helm add-on releases time out on first apply | Releases scheduled before any node was `Ready` | Two-pass apply — see [Deploying the infrastructure](#deploying-the-infrastructure) |
-| HPA pinned at `maxReplicas` with no traffic | Memory request too low; idle usage near the 50% target | Raise the memory request until idle sits well under target |
-| `kubectl run` fails with a `C:/Program Files/Git/...` path | MSYS path conversion | `MSYS_NO_PATHCONV=1`, or use `//bin/sh` |
-| Terraform plans an EKS version downgrade | Control plane auto-upgraded; `var.cluster_version` left behind | Match the variable to the live version, or target only the resource you want |
-| Terraform reports "no changes" after adding a file | The `.tf` file was saved outside `terraform/` | Terraform reads only its own working directory |
-| Jenkins UI unreachable on 8080 | `my_ip_cidr` no longer matches your public IP | `curl -s https://checkip.amazonaws.com`, update tfvars, re-apply |
-| Argo CD: `Write access to repository not granted` | Fine-grained PAT without this repo granted | Use a classic PAT with `repo` scope |
-| Argo CD stuck `Unknown` after fixing credentials | Repo server cached the failure | Restart `argocd-repo-server`, then hard-refresh the Application |
-| Argo CD port-forward resets the connection | `server.insecure: true` serves HTTP, not TLS | Forward to `:80` and browse over `http://` |
-| GitHub Actions: `Not authorized to perform sts:AssumeRoleWithWebIdentity` | OIDC subject mismatch — unresolved | See [Status at submission](#status-at-submission) |
-| GitOps files vanish from the `gitops` branch | `git merge main` replayed the deletion commit from `main` | `git checkout <commit> -- <paths>`; use cherry-pick instead of merge |
-| Ingress has no `ADDRESS` | Missing `kubernetes.io/role/elb` subnet tags, or ALB controller IRSA | `kubectl logs -n kube-system deploy/aws-load-balancer-controller` |
-| HPA shows `<unknown>/50%` | metrics-server absent, or no resource **requests** | Install metrics-server; set requests |
-| Pods `Pending`, node count flat | Autoscaler can't discover the ASG | Check `k8s.io/cluster-autoscaler/*` tags on the ASG; read autoscaler logs |
-| Jenkins: "You must be logged in to the server" | Jenkins IAM role not mapped into EKS | Confirm the `access_entries` block in `02-eks.tf` applied |
-| Jenkins: `docker: permission denied` | `jenkins` not in the `docker` group | `usermod -aG docker jenkins && systemctl restart jenkins` |
-| `ImagePullBackOff` | Node role lacks ECR read | `iam_role_additional_policies` in `02-eks.tf` |
-
-### State recovery
-
-If a network interruption kills an apply mid-write, Terraform writes `errored.tfstate`
-locally and leaves the remote lock held. Recover in this order:
+### Step 27 — Destroying the infrastructure
 
 ```bash
-terraform force-unlock <LOCK_ID>          # ID is in the error message
-terraform state push errored.tfstate
-terraform plan                            # confirm 0 to destroy before applying
-rm errored.tfstate
-```
-
----
-
-## Teardown
-
-Take your screenshots first — this is irreversible.
-
-Order matters. Terraform does not know about the load balancers and security groups the
-controller created, and will hang on the VPC delete if they are still present. There are
-**two** ALBs to release: the application's and Argo CD's.
-
-```bash
-kubectl delete -f argocd/application.yaml     # gitops branch only
-helm uninstall argocd -n argocd               # gitops branch only
-helm uninstall hello-world -n hello-world
-kubectl delete ingress --all -A
-# wait until both ALBs are gone from the EC2 console
 cd terraform
 terraform destroy
 ```
 
-Then confirm in the console that no ALBs, NAT gateways, Elastic IPs or orphaned ENIs remain.
-Running cost with the cluster, both ALBs, NAT gateway and Jenkins instance up is roughly
-$8/day.
+![terraform destroy complete, 85 resources destroyed](docs/screenshots/tf_destroy.png)
 
-Finally, revoke the GitHub personal access tokens created for Jenkins and Argo CD — they
-are no longer needed once the cluster is gone.
+85 resources removed, ending with the VPC itself.
+
+### Step 28 — Confirming nothing is still billing
+
+```bash
+aws eks list-clusters --region us-east-2
+```
+
+![aws eks list-clusters returning an empty list](docs/screenshots/eks_teardown.png)
+
+![EC2 console showing all instances terminated](docs/screenshots/ec2_terminated.png)
+
+All three instances terminated — the two `t3.small` workers and the
+`t3.medium` Jenkins controller. I also revoked the GitHub personal access
+tokens created for Argo CD, since they were no longer needed.
+
+Running cost with everything up was roughly $8/day.
+
+---
+
+## What I would do differently
+
+**Verify metrics before the load test, not during.** `kubectl top nodes`
+and the HPA's idle percentages are two commands that determine whether the
+entire scaling requirement is demonstrable. Both fail silently.
+
+**Check Java before installing Jenkins.** The user-data script installed
+Jenkins successfully and the service still would not start. Pinning
+`java-21-amazon-corretto-headless` in the script would have avoided the
+whole detour.
+
+**Never merge between intentionally divergent branches.** Cherry-pick.
+
+**Use classic tokens for Argo CD.** Fine-grained tokens fail with an error
+message that describes the wrong problem.
+
+**Debug the OIDC claim early.** I spent the end of the window checking
+configuration that was already correct. Printing the actual token subject
+would have been faster than inspecting every component that produces it.
+
+---
+
+## AI assistance
+
+The application code, Terraform, Helm chart and Jenkinsfile were initially
+generated with AI assistance, then reviewed and corrected by me as described
+in Step 4. I used AI throughout the build as a debugging aid — working
+through the Java version failure, the security group timeout, the HPA
+sizing problem and the Argo CD token issue. Screenshots of those
+conversations are in [docs/ai-conversation/](docs/ai-conversation/).
+
+Not everything it suggested was right. It proposed a Jenkinsfile edit that I
+applied incorrectly and wiped 106 lines of the pipeline, which I recovered
+from git history. It also suggested several fixes for the OIDC failure that
+turned out to be wrong, which is part of why that one is still unresolved —
+I was checking suggested causes instead of reading the actual token claim.
